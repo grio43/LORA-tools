@@ -104,6 +104,7 @@ class Config:
     save_filtered_metadata: bool = True
     filtered_metadata_format: str = "json"  # json | txt
     strip_json_details: bool = True
+    exclude_gifs: bool = True
     dry_run: bool = False
 
     # ---- Performance ------------------------------------------------------
@@ -166,6 +167,7 @@ def build_cli() -> argparse.ArgumentParser:
     p.add_argument("--no-download", dest="download", action="store_false", help="Skip image downloads")
     p.add_argument("--no-save-metadata", dest="save_meta", action="store_false", help="Do not save filtered metadata")
     p.add_argument("--dry-run", action="store_true", help="Exit after printing stats (implies --no-download)")
+    p.add_argument("--exclude-gifs", action="store_true", help="Exclude .gif files from the download list")
 
     # Perf
     p.add_argument("--workers", type=int, help="Number of download workers")
@@ -200,6 +202,9 @@ def apply_cli_overrides(args: argparse.Namespace, cfg: Config) -> None:
     if args.dry_run:
         cfg.dry_run = True
         cfg.download_images = False
+
+    if args.exclude_gifs: 
+        cfg.exclude_gifs = True 
 
 # ---------------------------------------------------------------------------
 # Metadata loading & filtering
@@ -291,8 +296,14 @@ def build_filter_mask(df: pd.DataFrame, cfg: Config) -> pd.Series:
     log.info("🔎 Applying filters...")
 
     if cfg.file_path_col in df.columns:
-        log.info("    Excluding .zip files from download list.")
-        mask &= ~df[cfg.file_path_col].str.lower().str.endswith('.zip', na=False)
+        # Define file extensions to exclude (add or remove as needed)
+        excluded_extensions = ('.zip', '.mp4', '.webm', '.swf')
+        log.info(f"    Excluding files with extensions: {', '.join(excluded_extensions)}")
+        mask &= ~df[cfg.file_path_col].str.lower().str.endswith(excluded_extensions, na=False)
+
+    if cfg.exclude_gifs:
+        log.info("    Excluding .gif files from download list.")
+        mask &= ~df[cfg.file_path_col].str.lower().str.endswith('.gif', na=False)
     
 
        # Artists --------------------------------------------------------
