@@ -118,7 +118,7 @@ class Config:
     exclude_artists: List[str] = field(default_factory=lambda: ["bob"])
 
     # Other filters
-    min_score: Optional[int] = 80
+    min_score: Optional[int] = 100
     ratings: List[str] = field(default_factory=lambda: ["safe", "general"])
     square_only: bool = False
     min_square_size: int = 1024
