@@ -75,7 +75,7 @@ class Config:
     # ---- Filtering Criteria (with placeholders) ---------------------------
     # General tags (e.g., appearance, actions, or objects)
     include_tags: List[str] = field(default_factory=lambda: ["1girl", "solo", "blue_sky"])
-    exclude_tags: List[str] = field(default_factory=lambda: ["loli", "Lolicon", "Lolicons", "shotacon"])
+    exclude_tags: List[str] = field(default_factory=lambda: ["loli", "Lolicon", "Lolicons", "shotacon", "3d", "comic", "blurry", "low quality", "bad anatomy", "bad hands", "watermark", "ai"])
 
     # Character tags (add or remove character names)
     include_characters: List[str] = field(default_factory=lambda: ["hakurei_reimu", "kirisame_marisa"])
@@ -90,14 +90,14 @@ class Config:
     exclude_artists: List[str] = field(default_factory=lambda: ["bob"])
 
     # Other filters
-    min_score: Optional[int] = 130
+    min_score: Optional[int] = 60
     ratings: List[str] = field(default_factory=lambda: ["safe", "general"])
     square_only: bool = False
     min_square_size: int = 1024
     min_width: int = 1024
     min_height: int = 1024
-    max_width: int = 0
-    max_height: int = 0
+    max_width: int = 90000
+    max_height: int = 90000
 
     # ---- Behaviour flags --------------------------------------------------
     download_images: bool = True

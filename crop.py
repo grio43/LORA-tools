@@ -76,12 +76,46 @@ def main():
   cv2.destroyWindow("Crop (draw, then press Enter)")
 
   # --- PREVIEW AND CONFIRMATION ---
-  cv2.imshow("Preview – Press Y to save, R to redo, Q to quit", cropped)
+  # NEW: Defined a constant for the window name and added the new hotkey
+  PREVIEW_WINDOW_NAME = "Preview – Y:Save | R:Redo | Shift+T:Delete | Q:Quit"
+  cv2.imshow(PREVIEW_WINDOW_NAME, cropped)
 
   while True:
-   key = cv2.waitKey(0) & 0xFF
+   # waitKey returns the ASCII value of the key pressed.
+   # For Shift+T, the value is for the uppercase 'T'.
+   key = cv2.waitKey(0)
 
-   if key in (ord('y'), 13): # 'y' or Enter key
+   # --- NEW: Hotkey to delete the image and its JSON file ---
+   # Note: We check for ord('T') which corresponds to Shift + 't'
+   if key == ord('T'):
+    print(" Deleting files...")
+    # Construct the corresponding JSON file path
+    json_path = os.path.splitext(fpath)[0] + ".json"
+
+    # Delete the image file
+    try:
+     os.remove(fpath)
+     print(f"🗑️ Deleted image: {os.path.basename(fpath)}")
+    except OSError as e:
+     print(f"❌ Error deleting image {fpath}: {e}")
+
+    # Delete the corresponding JSON file, if it exists
+    try:
+     os.remove(json_path)
+     print(f"🗑️ Deleted json:  {os.path.basename(json_path)}")
+    except FileNotFoundError:
+     pass # This is expected if there is no JSON file
+    except OSError as e:
+     print(f"❌ Error deleting json {json_path}: {e}")
+
+    cv2.destroyWindow(PREVIEW_WINDOW_NAME)
+    idx += 1 # Move to the next image
+    break # Exit preview loop
+
+   # For other keys, use a mask for better cross-platform compatibility
+   key_masked = key & 0xFF
+
+   if key_masked in (ord('y'), 13): # 'y' or Enter key
     if OVERWRITE:
      out_path = fpath
     else:
@@ -89,35 +123,33 @@ def main():
      os.makedirs(out_dir, exist_ok=True)
      out_path = os.path.join(out_dir, os.path.basename(fpath))
 
-    # --- NEW: Set save parameters for maximum quality ---
+    # Set save parameters for maximum quality
     ext = os.path.splitext(out_path)[1].lower()
     params = []
     if ext in ['.jpg', '.jpeg']:
-        # For JPEG, use 100 quality. This minimizes loss but doesn't eliminate it.
-        params = [cv2.IMWRITE_JPEG_QUALITY, 100]
+     params = [cv2.IMWRITE_JPEG_QUALITY, 100]
     elif ext == '.png':
-        # For PNG, use lower compression for faster saving. 0 is fastest. It is still lossless.
-        params = [cv2.IMWRITE_PNG_COMPRESSION, 0]
+     params = [cv2.IMWRITE_PNG_COMPRESSION, 0]
 
     cv2.imwrite(out_path, cropped, params)
     print(f"✅ Saved: {out_path}")
-    cv2.destroyWindow("Preview – Press Y to save, R to redo, Q to quit")
+    cv2.destroyWindow(PREVIEW_WINDOW_NAME)
     idx += 1 # Move to the next image
     break # Exit preview loop
 
-   elif key == ord('r'): # 'r' key
+   elif key_masked == ord('r'): # 'r' key
     print(" Redoing crop for this image.")
-    cv2.destroyWindow("Preview – Press Y to save, R to redo, Q to quit")
+    cv2.destroyWindow(PREVIEW_WINDOW_NAME)
     # Do not increment idx, just break the inner loop to restart on the same image
     break
 
-   elif key == ord('q'): # 'q' key
+   elif key_masked == ord('q'): # 'q' key
     cv2.destroyAllWindows()
     print("\nQuitting program.")
     return # Exit the main function entirely
 
   # If user presses 'r', the outer 'while idx < len(files)' loop will repeat for the same idx
-  # If user presses 'y', idx is incremented, and the loop will proceed to the next file
+  # If user presses 'y' or 'T', idx is incremented, and the loop will proceed to the next file
 
  print("\nAll done.")
 
