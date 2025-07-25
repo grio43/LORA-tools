@@ -75,7 +75,35 @@ class Config:
     # ---- Filtering Criteria (with placeholders) ---------------------------
     # General tags (e.g., appearance, actions, or objects)
     include_tags: List[str] = field(default_factory=lambda: ["1girl", "solo", "blue_sky"])
-    exclude_tags: List[str] = field(default_factory=lambda: ["loli", "Lolicon", "Lolicons", "shotacon", "3d", "comic", "blurry", "low quality", "bad anatomy", "bad hands", "watermark", "ai"])
+    exclude_tags: List[str] = field(default_factory=lambda: [
+        # --- Image Quality & Artifacts ---
+        "lowres", "blurry", "pixelated", "jpeg artifacts", "compression artifacts",
+        "low quality", "worst quality", "bad quality",
+        "watermark", "signature", "artist name", "logo", "stamp",
+        "text", "english_text", "speech bubble",
+
+        # --- Anatomy & Proportions ---
+        "bad anatomy", "bad hands", "bad proportions", "malformed limbs",
+        "mutated hands", "extra limbs", "extra fingers", "fused fingers",
+        "long neck", "deformed", "disfigured", "mutation", "poorly drawn face",
+
+        # --- Unwanted Art Styles ---
+        "3d", "cgi", "render", "vray",
+        "comic", "sketch", "lineart",
+        "2d",
+
+        # --- Composition & Framing ---
+        "grid", "collage", "multi-panel", "multiple views", "split screen",
+        "border", "frame", "out of frame", "cropped",
+
+        # --- Color & Tone ---
+        "monochrome", "grayscale",
+
+        # --- AI ---
+        "ai generated", "ai art", "ai generated art", "ai generated image", "ai_generated", "ai_art",  "ai_artwork", "ai_image", "ai_artwork","ai artifact",
+        # --- General Undesirables ---
+        "ugly", "grotesque", "loli", "loli_(style)", "loli_(character)", "lolicon", "loli", "Lolicon", "Lolicons", "shotacon", "shotacon_(style)", "shotacon_(character)", "shotacon", "Shotacon", "Shotacons",
+    ])
 
     # Character tags (add or remove character names)
     include_characters: List[str] = field(default_factory=lambda: ["hakurei_reimu", "kirisame_marisa"])
@@ -90,7 +118,7 @@ class Config:
     exclude_artists: List[str] = field(default_factory=lambda: ["bob"])
 
     # Other filters
-    min_score: Optional[int] = 60
+    min_score: Optional[int] = 80
     ratings: List[str] = field(default_factory=lambda: ["safe", "general"])
     square_only: bool = False
     min_square_size: int = 1024
@@ -108,7 +136,7 @@ class Config:
     dry_run: bool = False
 
     # ---- Performance ------------------------------------------------------
-    workers: int = 8
+    workers: int = 16
 
 
 
@@ -319,24 +347,25 @@ def build_filter_mask(df: pd.DataFrame, cfg: Config) -> pd.Series:
 # Tags ----------------------------------------------------------
     # This block handles positive and negative tag filtering independently.
 
-    # Only create the cleaned tag series once if we are using either filter.
+# Only create the cleaned tag series once if we are using either filter.
     if (cfg.enable_include_tags and cfg.include_tags) or \
-       (cfg.enable_exclude_tags and cfg.exclude_tags):
+     (cfg.enable_exclude_tags and cfg.exclude_tags):
         tag_series = df[cfg.tags_col].str.lower().fillna("")
 
-        # Apply positive (include) tag filters
-        if cfg.enable_include_tags and cfg.include_tags:
-            log.info(f"    Including tags: {cfg.include_tags}")
-            # This pattern ensures all specified tags are present in any order.
-            pattern = "(?=.*" + ")(?=.*".join(map(re.escape, cfg.include_tags)) + ")"
-            mask &= tag_series.str.contains(pattern, regex=True, na=False)
+    # Apply positive (include) tag filters
+    if cfg.enable_include_tags and cfg.include_tags:
+        log.info(f"    Including tags: {cfg.include_tags}")
+        # Sequentially apply filters for each required tag.
+        # This is more verbose but avoids a single, complex regex.
+        for tag in cfg.include_tags:
+            mask &= tag_series.str.contains(r"\b" + re.escape(tag) + r"\b", regex=True, na=False)
 
-        # Apply negative (exclude) tag filters
-        if cfg.enable_exclude_tags and cfg.exclude_tags:
-            log.info(f"    Excluding tags: {cfg.exclude_tags}")
-            # This pattern checks for the presence of any of the excluded tags.
-            pattern = "|".join(map(re.escape, cfg.exclude_tags))
-            mask &= ~tag_series.str.contains(pattern, regex=True, na=False)
+    # Apply negative (exclude) tag filters
+    if cfg.enable_exclude_tags and cfg.exclude_tags:
+        log.info(f"    Excluding tags: {cfg.exclude_tags}")
+        # Create one large regex for all exclusions. This is generally fast for "any of" logic.
+        pattern = r"\b(" + "|".join(map(re.escape, cfg.exclude_tags)) + r")\b"
+        mask &= ~tag_series.str.contains(pattern, regex=True, na=False)
 
     # Score ---------------------------------------------------------
     if cfg.enable_score_filtering and cfg.min_score is not None:
