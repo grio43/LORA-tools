@@ -62,11 +62,11 @@ class Config:
     id_col: str = "id"
 
     # ---- Filtering Toggles (Set to False to disable a filter group) ------
-    enable_include_tags: bool = False
+    enable_include_tags: bool = True
     enable_exclude_tags: bool = True
     enable_character_filtering: bool = False
     enable_copyright_filtering: bool = False
-    enable_artist_filtering: bool = False
+    enable_artist_filtering: bool = True
     enable_score_filtering: bool = True
     enable_rating_filtering: bool = False
     enable_dimension_filtering: bool = True
@@ -74,7 +74,7 @@ class Config:
 
     # ---- Filtering Criteria (with placeholders) ---------------------------
     # General tags (e.g., appearance, actions, or objects)
-    include_tags: List[str] = field(default_factory=lambda: ["1girl", "solo", "blue_sky"])
+    include_tags: List[str] = field(default_factory=lambda: ["absurdly_detailed_composition"])
     exclude_tags: List[str] = field(default_factory=lambda: [
         # --- Image Quality & Artifacts ---
         "lowres", "blurry", "pixelated", "jpeg artifacts", "compression artifacts",
@@ -114,11 +114,11 @@ class Config:
     exclude_copyrights: List[str] = field(default_factory=lambda: ["some_series_to_exclude"])
 
     # Artist tags (add or remove specific artist names)
-    include_artists: List[str] = field(default_factory=lambda: ["guweiz"])
+    include_artists: List[str] = field(default_factory=lambda: ["cutesexyrobutts"])
     exclude_artists: List[str] = field(default_factory=lambda: ["bob"])
 
     # Other filters
-    min_score: Optional[int] = 100
+    min_score: Optional[int] = 30
     ratings: List[str] = field(default_factory=lambda: ["safe", "general"])
     square_only: bool = False
     min_square_size: int = 1024
@@ -136,7 +136,7 @@ class Config:
     dry_run: bool = False
 
     # ---- Performance ------------------------------------------------------
-    workers: int = 16
+    workers: int = 10
 
 
 
@@ -336,36 +336,50 @@ def build_filter_mask(df: pd.DataFrame, cfg: Config) -> pd.Series:
 
        # Artists --------------------------------------------------------
     if cfg.enable_artist_filtering and (cfg.include_artists or cfg.exclude_artists):
+        # Using .str.lower() and re.IGNORECASE is redundant but safe.
         artist_series = df[cfg.artist_tags_col].str.lower().fillna("")
-        if cfg.include_artists:
-            pattern = r"\b(" + "|".join(map(re.escape, cfg.include_artists)) + r")\b"
-            mask &= artist_series.str.contains(pattern, regex=True)
-        if cfg.exclude_artists:
-            pattern = r"\b(" + "|".join(map(re.escape, cfg.exclude_artists)) + r")\b"
-            mask &= ~artist_series.str.contains(pattern, regex=True)
 
+        if cfg.include_artists:
+            # This robust pattern ensures we match the whole artist tag.
+            # It looks for the tag preceded by a space or the start of the string (^),
+            # and followed by a space or the end of the string ($).
+            pattern = r"(^| )(" + "|".join(map(re.escape, cfg.include_artists)) + r")( |$)"
+            mask &= artist_series.str.contains(pattern, regex=True, flags=re.IGNORECASE)
+            
+        if cfg.exclude_artists:
+            # Same logic applies to exclusions.
+            pattern = r"(^| )(" + "|".join(map(re.escape, cfg.exclude_artists)) + r")( |$)"
+            mask &= ~artist_series.str.contains(pattern, regex=True, flags=re.IGNORECASE)
+            
 # Tags ----------------------------------------------------------
     # This block handles positive and negative tag filtering independently.
 
 # Only create the cleaned tag series once if we are using either filter.
     if (cfg.enable_include_tags and cfg.include_tags) or \
-     (cfg.enable_exclude_tags and cfg.exclude_tags):
+       (cfg.enable_exclude_tags and cfg.exclude_tags):
+        # Using .str.lower() and re.IGNORECASE is redundant but safe.
+        # It ensures case-insensitivity regardless of input.
         tag_series = df[cfg.tags_col].str.lower().fillna("")
 
     # Apply positive (include) tag filters
     if cfg.enable_include_tags and cfg.include_tags:
         log.info(f"    Including tags: {cfg.include_tags}")
-        # Sequentially apply filters for each required tag.
-        # This is more verbose but avoids a single, complex regex.
+        # Sequentially apply filters for each required tag using AND logic.
         for tag in cfg.include_tags:
-            mask &= tag_series.str.contains(r"\b" + re.escape(tag) + r"\b", regex=True, na=False)
+            # This robust pattern ensures we match the whole tag.
+            # It looks for the tag preceded by a space or the start of the string (^),
+            # and followed by a space or the end of the string ($).
+            pattern = r"(^| )" + re.escape(tag) + r"( |$)"
+            mask &= tag_series.str.contains(pattern, regex=True, na=False, flags=re.IGNORECASE)
 
     # Apply negative (exclude) tag filters
     if cfg.enable_exclude_tags and cfg.exclude_tags:
         log.info(f"    Excluding tags: {cfg.exclude_tags}")
-        # Create one large regex for all exclusions. This is generally fast for "any of" logic.
-        pattern = r"\b(" + "|".join(map(re.escape, cfg.exclude_tags)) + r")\b"
-        mask &= ~tag_series.str.contains(pattern, regex=True, na=False)
+        # Create one large regex for all exclusions using OR logic.
+        # This pattern prevents accidentally matching parts of other tags.
+        # e.g., excluding 'ai' will not exclude 'maid' or 'ai_generated'.
+        pattern = r"(^| )(" + "|".join(map(re.escape, cfg.exclude_tags)) + r")( |$)"
+        mask &= ~tag_series.str.contains(pattern, regex=True, na=False, flags=re.IGNORECASE)
 
     # Score ---------------------------------------------------------
     if cfg.enable_score_filtering and cfg.min_score is not None:
