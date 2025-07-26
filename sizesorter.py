@@ -11,7 +11,7 @@ end_folder = r"J:\New file\Danbooru2004\Images\new"
 # Set the number of worker threads. The optimal number depends on your disk.
 # For an HDD, start with 4-8. For a fast SSD, you can try 8-16.
 # More is not always better, so you may need to experiment.
-MAX_WORKERS = 10
+MAX_WORKERS = 36
 # --- End of Configuration ---
 
 # A set of common image file extensions for faster checking.

@@ -62,20 +62,22 @@ class Config:
     id_col: str = "id"
 
     # ---- Filtering Toggles (Set to False to disable a filter group) ------
-    enable_include_tags: bool = True
-    enable_exclude_tags: bool = True
-    enable_character_filtering: bool = False
-    enable_copyright_filtering: bool = False
-    enable_artist_filtering: bool = True
-    enable_score_filtering: bool = True
-    enable_rating_filtering: bool = False
-    enable_dimension_filtering: bool = True
-    per_image_json: bool = True
+    enable_include_tags: bool = True      # <-- 
+    enable_exclude_tags: bool = True     # <-- 
+    enable_character_filtering: bool = False # <--
+    enable_copyright_filtering: bool = False # <--
+    enable_artist_filtering: bool = False # <--
+    enable_score_filtering: bool = True   # <-- 
+    enable_rating_filtering: bool = False # <--
+    enable_dimension_filtering: bool = True # <-- 
+    per_image_json: bool = True # <--
 
     # ---- Filtering Criteria (with placeholders) ---------------------------
     # General tags (e.g., appearance, actions, or objects)
-    include_tags: List[str] = field(default_factory=lambda: ["absurdly_detailed_composition"])
-    exclude_tags: List[str] = field(default_factory=lambda: [
+    # "absurdly" will latch onto an exact string match.
+    # Use "absurdly*" for prefix matching.
+    include_tags: List[str] = field(default_factory=lambda: ["hand*"]) # <--
+    exclude_tags: List[str] = field(default_factory=lambda: [  
         # --- Image Quality & Artifacts ---
         "lowres", "blurry", "pixelated", "jpeg artifacts", "compression artifacts",
         "low quality", "worst quality", "bad quality",
@@ -89,8 +91,9 @@ class Config:
 
         # --- Unwanted Art Styles ---
         "3d", "cgi", "render", "vray",
-        "comic", "sketch", "lineart",
-        "2d",
+        "comic",
+        # --- People ---
+        "2girls", "3girls", "2boys", "3boys",
 
         # --- Composition & Framing ---
         "grid", "collage", "multi-panel", "multiple views", "split screen",
@@ -114,29 +117,29 @@ class Config:
     exclude_copyrights: List[str] = field(default_factory=lambda: ["some_series_to_exclude"])
 
     # Artist tags (add or remove specific artist names)
-    include_artists: List[str] = field(default_factory=lambda: ["cutesexyrobutts"])
+    include_artists: List[str] = field(default_factory=lambda: ["cutesexyrobutts*"])
     exclude_artists: List[str] = field(default_factory=lambda: ["bob"])
 
     # Other filters
-    min_score: Optional[int] = 30
+    min_score: Optional[int] = 30 # <--
     ratings: List[str] = field(default_factory=lambda: ["safe", "general"])
-    square_only: bool = False
-    min_square_size: int = 1024
-    min_width: int = 1024
-    min_height: int = 1024
-    max_width: int = 90000
-    max_height: int = 90000
+    square_only: bool = False # <--
+    min_square_size: int = 1024 # <--
+    min_width: int = 1024 # <--
+    min_height: int = 1024 # <--
+    max_width: int = 90000 # <--
+    max_height: int = 90000 # <--
 
     # ---- Behaviour flags --------------------------------------------------
-    download_images: bool = True
-    save_filtered_metadata: bool = True
-    filtered_metadata_format: str = "json"  # json | txt
-    strip_json_details: bool = True
-    exclude_gifs: bool = True
-    dry_run: bool = False
+    download_images: bool = True # <--
+    save_filtered_metadata: bool = True # <--
+    filtered_metadata_format: str = "json"  # json | txt # <--
+    strip_json_details: bool = True # <--
+    exclude_gifs: bool = True # <--
+    dry_run: bool = False # <--
 
     # ---- Performance ------------------------------------------------------
-    workers: int = 10
+    workers: int = 15 # <--
 
 
 
@@ -321,83 +324,106 @@ def load_metadata(path: Path, cfg: Config) -> pd.DataFrame:
 def build_filter_mask(df: pd.DataFrame, cfg: Config) -> pd.Series:
     """Return boolean mask for rows matching cfg filters."""
     mask = pd.Series(True, index=df.index)
-    log.info("🔎 Applying filters...")
+    log.info
 
+    # --- File Type Filtering -----------------------------------------
     if cfg.file_path_col in df.columns:
-        # Define file extensions to exclude (add or remove as needed)
         excluded_extensions = ('.zip', '.mp4', '.webm', '.swf')
         log.info(f"    Excluding files with extensions: {', '.join(excluded_extensions)}")
         mask &= ~df[cfg.file_path_col].str.lower().str.endswith(excluded_extensions, na=False)
 
-    if cfg.exclude_gifs:
+    if cfg.exclude_gifs and cfg.file_path_col in df.columns:
         log.info("    Excluding .gif files from download list.")
         mask &= ~df[cfg.file_path_col].str.lower().str.endswith('.gif', na=False)
-    
 
-       # Artists --------------------------------------------------------
-    if cfg.enable_artist_filtering and (cfg.include_artists or cfg.exclude_artists):
-        # Using .str.lower() and re.IGNORECASE is redundant but safe.
-        artist_series = df[cfg.artist_tags_col].str.lower().fillna("")
+    # --- Tag-based Filtering -----------------------------------------
+    # Helper function to avoid code repetition
+    def apply_tag_filters(series: pd.Series, include_list: List[str], exclude_list: List[str], log_name: str):
+        nonlocal mask
+        # Inclusion (AND logic): image must have ALL specified tags.
+        if include_list:
+            log.info(f"    Including {log_name} (ALL required): {include_list}")
+            for tag in include_list:
+                if tag.endswith('*'):
+                    # It's a prefix search: find words STARTING WITH the tag.
+                    clean_tag = tag.rstrip('*')
+                    pattern = r"(^| )" + re.escape(clean_tag)
+                else:
+                    # It's an exact search: match the WHOLE word.
+                    pattern = r"(^| )" + re.escape(tag) + r"( |$)"
+                
+                # This line applies the filter for each included tag
+                mask &= series.str.contains(pattern, regex=True, na=False, flags=re.IGNORECASE)
 
-        if cfg.include_artists:
-            # This robust pattern ensures we match the whole artist tag.
-            # It looks for the tag preceded by a space or the start of the string (^),
-            # and followed by a space or the end of the string ($).
-            pattern = r"(^| )(" + "|".join(map(re.escape, cfg.include_artists)) + r")( |$)"
-            mask &= artist_series.str.contains(pattern, regex=True, flags=re.IGNORECASE)
+        # Exclusion (OR logic): image must not have ANY of these tags.
+        if exclude_list:
+            log.info(f"    Excluding {log_name} (ANY will be excluded): {exclude_list}")
             
-        if cfg.exclude_artists:
-            # Same logic applies to exclusions.
-            pattern = r"(^| )(" + "|".join(map(re.escape, cfg.exclude_artists)) + r")( |$)"
-            mask &= ~artist_series.str.contains(pattern, regex=True, flags=re.IGNORECASE)
+            # Build separate regex patterns for exact and prefix matches
+            exact_excludes = [tag for tag in exclude_list if not tag.endswith('*')]
+            prefix_excludes = [tag.rstrip('*') for tag in exclude_list if tag.endswith('*')]
             
-# Tags ----------------------------------------------------------
-    # This block handles positive and negative tag filtering independently.
+            patterns = []
+            if exact_excludes:
+                patterns.append(r"(^| )(" + "|".join(map(re.escape, exact_excludes)) + r")( |$)")
+            if prefix_excludes:
+                patterns.append(r"(^| )(" + "|".join(map(re.escape, prefix_excludes)) + r")")
 
-# Only create the cleaned tag series once if we are using either filter.
-    if (cfg.enable_include_tags and cfg.include_tags) or \
-       (cfg.enable_exclude_tags and cfg.exclude_tags):
-        # Using .str.lower() and re.IGNORECASE is redundant but safe.
-        # It ensures case-insensitivity regardless of input.
-        tag_series = df[cfg.tags_col].str.lower().fillna("")
+            # Combine patterns if any exist and apply the filter
+            if patterns:
+                final_pattern = "|".join(patterns)
+                mask &= ~series.str.contains(final_pattern, regex=True, na=False, flags=re.IGNORECASE)
 
-    # Apply positive (include) tag filters
-    if cfg.enable_include_tags and cfg.include_tags:
-        log.info(f"    Including tags: {cfg.include_tags}")
-        # Sequentially apply filters for each required tag using AND logic.
-        for tag in cfg.include_tags:
-            # This robust pattern ensures we match the whole tag.
-            # It looks for the tag preceded by a space or the start of the string (^),
-            # and followed by a space or the end of the string ($).
-            pattern = r"(^| )" + re.escape(tag) + r"( |$)"
-            mask &= tag_series.str.contains(pattern, regex=True, na=False, flags=re.IGNORECASE)
+    # General Tags
+    if cfg.enable_include_tags or cfg.enable_exclude_tags:
+        if cfg.tags_col in df.columns:
+            tag_series = df[cfg.tags_col].str.lower().fillna("")
+            
+            # Conditionally create the lists to pass to the helper function
+            include_list = cfg.include_tags if cfg.enable_include_tags else []
+            exclude_list = cfg.exclude_tags if cfg.enable_exclude_tags else []
+            
+            # Only call the function if there's actually something to do
+            if include_list or exclude_list:
+                apply_tag_filters(tag_series, include_list, exclude_list, "general tags")
+        else:
+            log.warning(f"'{cfg.tags_col}' not found. Skipping general tag filtering.")
 
-    # Apply negative (exclude) tag filters
-    if cfg.enable_exclude_tags and cfg.exclude_tags:
-        log.info(f"    Excluding tags: {cfg.exclude_tags}")
-        # Create one large regex for all exclusions using OR logic.
-        # This pattern prevents accidentally matching parts of other tags.
-        # e.g., excluding 'ai' will not exclude 'maid' or 'ai_generated'.
-        pattern = r"(^| )(" + "|".join(map(re.escape, cfg.exclude_tags)) + r")( |$)"
-        mask &= ~tag_series.str.contains(pattern, regex=True, na=False, flags=re.IGNORECASE)
+    # Copyright Tags
+    if cfg.enable_copyright_filtering:
+        if cfg.copyright_tags_col in df.columns:
+            copy_series = df[cfg.copyright_tags_col].str.lower().fillna("")
+            apply_tag_filters(copy_series, cfg.include_copyrights, cfg.exclude_copyrights, "copyrights")
+        else:
+            log.warning(f"'{cfg.copyright_tags_col}' not found. Skipping copyright filtering.")
 
-    # Score ---------------------------------------------------------
+    # Artist Tags
+    if cfg.enable_artist_filtering:
+        if cfg.artist_tags_col in df.columns:
+            artist_series = df[cfg.artist_tags_col].str.lower().fillna("")
+            apply_tag_filters(artist_series, cfg.include_artists, cfg.exclude_artists, "artists")
+        else:
+            log.warning(f"'{cfg.artist_tags_col}' not found. Skipping artist filtering.")
+
+    # --- Metadata Filtering ------------------------------------------
+    # Score
     if cfg.enable_score_filtering and cfg.min_score is not None:
         log.info(f"    Filtering for score >= {cfg.min_score}")
         mask &= df[cfg.score_col].fillna(0) >= cfg.min_score
 
-    # Ratings -------------------------------------------------------
+    # Ratings
     if cfg.enable_rating_filtering and cfg.ratings:
         log.info(f"    Filtering for ratings: {cfg.ratings}")
         mask &= df[cfg.rating_col].fillna("").isin(cfg.ratings)
 
-    # Dimensions ----------------------------------------------------
+    # Dimensions
     if cfg.enable_dimension_filtering:
         w, h = df[cfg.width_col], df[cfg.height_col]
         if cfg.square_only:
-            log.info("    Filtering for square images only.")
+            log.info(f"    Filtering for square images >= {cfg.min_square_size}px.")
             mask &= (w == h) & (w >= cfg.min_square_size)
         else:
+            log.info(f"    Filtering for dimensions: {cfg.min_width}x{cfg.min_height} to {cfg.max_width}x{cfg.max_height}")
             if cfg.min_width > 0: mask &= w >= cfg.min_width
             if cfg.min_height > 0: mask &= h >= cfg.min_height
             if cfg.max_width > 0: mask &= w <= cfg.max_width
