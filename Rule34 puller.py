@@ -50,33 +50,33 @@ class Config:
     hf_auth_token: Optional[str] = os.getenv("Add token", None)  # Set your token here or use env var
 
     # ---- Column names (aligns with DeepGHS conventions) -------------------
-    tags_col: str = "tag_string"
-    character_tags_col: str = "tag_string_character"
-    copyright_tags_col: str = "tag_string_copyright"
-    artist_tags_col: str = "tag_string_artist"
+    tags_col: str = "tags"                      # Changed from "tag_string"
+    #character_tags_col: str = "tag_string_character"  # No change needed as filter is off
+    #copyright_tags_col: str = "tag_string_copyright"  # No change needed as filter is off
+    #artist_tags_col: str = "tag_string_artist"      # No change needed as filter is off
     score_col: str = "score"
     rating_col: str = "rating"
-    width_col: str = "image_width"
-    height_col: str = "image_height"
+    width_col: str = "width"                    # Changed from "image_width"
+    height_col: str = "height"                  # Changed from "image_height"
     file_path_col: str = "file_url"
     id_col: str = "id"
 
     # ---- Filtering Toggles (Set to False to disable a filter group) ------
-    enable_include_tags: bool = True      # <-- 
-    enable_exclude_tags: bool = True     # <-- 
-    enable_character_filtering: bool = False # <--
-    enable_copyright_filtering: bool = False # <--
-    enable_artist_filtering: bool = False # <--
-    enable_score_filtering: bool = True   # <-- 
-    enable_rating_filtering: bool = False # <--
-    enable_dimension_filtering: bool = True # <-- 
-    per_image_json: bool = True # <--
+    enable_include_tags: bool = True
+    enable_exclude_tags: bool = True
+    #enable_character_filtering: bool = False # <-- SET TO FALSE
+    #enable_copyright_filtering: bool = False # <-- SET TO FALSE
+    #enable_artist_filtering: bool = False # <-- SET TO FALSE
+    enable_score_filtering: bool = True
+    enable_rating_filtering: bool = False
+    enable_dimension_filtering: bool = True 
+    per_image_json: bool = True
 
     # ---- Filtering Criteria (with placeholders) ---------------------------
     # General tags (e.g., appearance, actions, or objects)
     # "absurdly" will latch onto an exact string match.
     # Use "absurdly*" for prefix matching.
-    include_tags: List[str] = field(default_factory=lambda: ["hand*"]) # <--
+    include_tags: List[str] = field(default_factory=lambda: ["*eye"]) # <--
     exclude_tags: List[str] = field(default_factory=lambda: [  
         # --- Image Quality & Artifacts ---
         "lowres", "blurry", "pixelated", "jpeg artifacts", "compression artifacts",
@@ -105,7 +105,7 @@ class Config:
         # --- AI ---
         "ai generated", "ai art", "ai generated art", "ai generated image", "ai_generated", "ai_art",  "ai_artwork", "ai_image", "ai_artwork","ai artifact",
         # --- General Undesirables ---
-        "ugly", "grotesque", "loli", "loli_(style)", "loli_(character)", "lolicon", "loli", "Lolicon", "Lolicons", "shotacon", "shotacon_(style)", "shotacon_(character)", "shotacon", "Shotacon", "Shotacons",
+        "ugly", "grotesque", "loli", "loli_(style)", "loli_(character)", "lolicon", "loli", "Lolicon", "Lolicons", "shotacon", "shotacon_(style)", "shotacon_(character)", "shotacon", "Shotacon", "Shotacons"
     ])
 
     # Character tags (add or remove character names)
@@ -337,39 +337,52 @@ def build_filter_mask(df: pd.DataFrame, cfg: Config) -> pd.Series:
         mask &= ~df[cfg.file_path_col].str.lower().str.endswith('.gif', na=False)
 
     # --- Tag-based Filtering -----------------------------------------
-    # Helper function to avoid code repetition
+# Helper function to avoid code repetition
     def apply_tag_filters(series: pd.Series, include_list: List[str], exclude_list: List[str], log_name: str):
         nonlocal mask
+
+        def _create_pattern(tag: str) -> str:
+            """Generates a regex pattern based on wildcard usage in the tag."""
+            starts_with_star = tag.startswith('*')
+            ends_with_star = tag.endswith('*')
+            clean_tag = tag.strip('*')
+            escaped_tag = re.escape(clean_tag)
+
+            # Case 1: Substring match (e.g., "*dog*")
+            if starts_with_star and ends_with_star:
+                return escaped_tag
+            
+            # Case 2: Prefix match (e.g., "dog*")
+            elif ends_with_star:
+                # Matches "dog_boy", "dogs", but not "good_dog"
+                return r"\b" + escaped_tag
+
+            # Case 3: Suffix match (e.g., "*dog")
+            elif starts_with_star:
+                # Matches "good_dog", but not "dogs" or "dog_boy"
+                return escaped_tag + r"\b"
+
+            # Case 4: Exact whole-word match (e.g., "dog")
+            else:
+                # This is the most efficient pattern for exact matches.
+                return r"\b" + escaped_tag + r"\b"
+
         # Inclusion (AND logic): image must have ALL specified tags.
         if include_list:
             log.info(f"    Including {log_name} (ALL required): {include_list}")
             for tag in include_list:
-                if tag.endswith('*'):
-                    # It's a prefix search: find words STARTING WITH the tag.
-                    clean_tag = tag.rstrip('*')
-                    pattern = r"(^| )" + re.escape(clean_tag)
-                else:
-                    # It's an exact search: match the WHOLE word.
-                    pattern = r"(^| )" + re.escape(tag) + r"( |$)"
-                
-                # This line applies the filter for each included tag
+                if not tag: continue # Skip empty strings
+                pattern = _create_pattern(tag)
                 mask &= series.str.contains(pattern, regex=True, na=False, flags=re.IGNORECASE)
 
         # Exclusion (OR logic): image must not have ANY of these tags.
         if exclude_list:
             log.info(f"    Excluding {log_name} (ANY will be excluded): {exclude_list}")
             
-            # Build separate regex patterns for exact and prefix matches
-            exact_excludes = [tag for tag in exclude_list if not tag.endswith('*')]
-            prefix_excludes = [tag.rstrip('*') for tag in exclude_list if tag.endswith('*')]
+            # Combine all non-empty exclusion patterns into a single regex with '|'.
+            # This is more efficient than applying .str.contains in a loop.
+            patterns = [_create_pattern(tag) for tag in exclude_list if tag]
             
-            patterns = []
-            if exact_excludes:
-                patterns.append(r"(^| )(" + "|".join(map(re.escape, exact_excludes)) + r")( |$)")
-            if prefix_excludes:
-                patterns.append(r"(^| )(" + "|".join(map(re.escape, prefix_excludes)) + r")")
-
-            # Combine patterns if any exist and apply the filter
             if patterns:
                 final_pattern = "|".join(patterns)
                 mask &= ~series.str.contains(final_pattern, regex=True, na=False, flags=re.IGNORECASE)
