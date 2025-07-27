@@ -4,8 +4,8 @@ import glob
 import sys
 import shutil
 import math
-import threading
-import keyboard # Using the 'keyboard' library for cross-platform hotkey support
+import time # <-- ADDED: To pause briefly for the user to see the warning.
+import keyboard
 
 # --- Global flag for soft stop ---
 stop_requested = False
@@ -24,15 +24,19 @@ EXTENSIONS = ["*.jpg", "*.jpeg", "*.png", "*.tif", "*.bmp"]
 MIN_SIZE = 1024
 
 # 📈 Multi-Crop Trigger Factor.
-MULTI_CROP_THRESHOLD_FACTOR = 1.25
+MULTI_CROP_THRESHOLD_FACTOR = 1.3
 
 # 📐 Overlap percentage for sequential crops.
 OVERLAP_PERCENT = 0.18
 
-#  Hotkey to signal a stop after the current file is processed.
-STOP_KEY = 'q'
-# ----------------------------------------------------------
-# The interactive preview has been removed for bulk processing.
+# 🗑️ Delete the original file after successful cropping.
+# Set this to True ONLY if you are certain. It is recommended to back up data first.
+DELETE_ORIGINAL = True # ↖ CHANGE THIS TO True TO ENABLE DELETION
+
+# Hotkey to signal a stop after the current file is processed.
+# This combination will be checked by holding the keys down.
+STOP_KEY = 'shift+q+e' # <-- This string is used by keyboard.is_pressed()
+STOP_KEY_DISPLAY = 'Shift + Q + E'
 # ----------------------------------------------------------
 
 def list_files(folder, patterns):
@@ -84,21 +88,16 @@ def generate_controlled_rois(img_w, img_h, min_size, overlap_percent, threshold_
 
     return rois
 
-def hotkey_listener():
-    """Waits for the stop key to be pressed and sets the global stop_requested flag."""
-    global stop_requested
-    keyboard.wait(STOP_KEY)
-    stop_requested = True
-    print(f"\n🛑 Stop requested. The script will halt after finishing the current file. 🛑")
-
-
 def main():
     """Main function to iterate through images, generate controlled crops, and save them."""
-    
-    # Start the hotkey listener in a separate thread
-    print(f"Press '{STOP_KEY}' at any time to gracefully stop the script after the current file.")
-    listener_thread = threading.Thread(target=hotkey_listener, daemon=True)
-    listener_thread.start()
+    global stop_requested
+
+    # --- CHANGED: Removed hotkey registration, added a direct warning. ---
+    print("--- SCRIPT CONTROLS ---")
+    print(f"To stop gracefully, HOLD DOWN [{STOP_KEY_DISPLAY}] until you see the 'Stop requested' message.")
+    print("❗ IMPORTANT: The hotkey may only work if you run this script with administrator/root privileges!")
+    print("-----------------------")
+    time.sleep(3) # Give user time to read the message.
 
     files = list_files(SOURCE_FOLDER, EXTENSIONS)
     if not files:
@@ -108,6 +107,13 @@ def main():
     os.makedirs(MULTI_CROP_FOLDER, exist_ok=True)
 
     for idx, fpath in enumerate(files):
+        # --- CHANGED: Replaced hotkey listener with a direct state check. ---
+        # This checks the keyboard state at the beginning of each loop.
+        if keyboard.is_pressed(STOP_KEY):
+            if not stop_requested: # This prevents the message from printing on every loop if keys are held.
+                stop_requested = True
+                print(f"\n🛑 Stop requested. The script will halt after finishing the current file. 🛑")
+
         # Check if a stop has been requested before processing the next file
         if stop_requested:
             print("\nSoft stop initiated. Halting processing.")
@@ -132,10 +138,8 @@ def main():
                 print(f"  -> Skipping image smaller than MIN_SIZE ({min(img_h, img_w)} < {MIN_SIZE}).")
                 continue
 
-            # --- Generate ROIs based on the controlled strategy ---
             collected_rois = generate_controlled_rois(img_w, img_h, MIN_SIZE, OVERLAP_PERCENT, MULTI_CROP_THRESHOLD_FACTOR)
 
-            # --- PROCESS FILE (SAVE CROPS) ---
             if collected_rois:
                 print(f"  -> Saving {len(collected_rois)} new crop(s)...")
                 base_name, ext = os.path.splitext(base_name_with_ext)
@@ -154,19 +158,14 @@ def main():
                         new_json_path = os.path.join(MULTI_CROP_FOLDER, new_json_filename)
                         shutil.copy2(original_json_path, new_json_path)
                 
-                # --- SAFELY COMMENTED OUT ---
-                # This section is disabled to prevent accidental data loss.
-                # If you are certain you want to delete the originals after cropping,
-                # you can uncomment the following lines.
-                # --------------------------------------------------------------------
-                # print(f"  -> Removing original file: {base_name_with_ext}")
-                # try:
-                #     if os.path.exists(fpath): os.remove(fpath)
-                #     if os.path.exists(original_json_path): os.remove(original_json_path)
-                #     print(f"  -> Removed Original: {base_name_with_ext}")
-                # except OSError as e:
-                #     print(f"  -> ❌ Error removing original file: {e}")
-                # --------------------------------------------------------------------
+                if DELETE_ORIGINAL:
+                    print(f"  -> Deleting original file as per setting: {base_name_with_ext}")
+                    try:
+                        if os.path.exists(fpath): os.remove(fpath)
+                        if os.path.exists(original_json_path): os.remove(original_json_path)
+                        print(f"  -> Successfully deleted original: {base_name_with_ext}")
+                    except OSError as e:
+                        print(f"  -> ❌ Error deleting original file: {e}")
 
         except Exception as e:
             print(f"An unexpected ERROR occurred while processing {fpath}: {e}")

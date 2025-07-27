@@ -43,12 +43,7 @@ class Config:
 
     # ---- Paths ------------------------------------------------------------
     metadata_db_paths: List[str] = field(default_factory=lambda: [
-        r"J:\New file\rule34_full\table-1.parquet",
-        r"J:\New file\rule34_full\table-2.parquet",
-        r"J:\New file\rule34_full\table-3.parquet",
-        r"J:\New file\rule34_full\table-4.parquet",
-        r"J:\New file\rule34_full\table-5.parquet",
-        r"J:\New file\rule34_full\table-6.parquet",
+        r"J:\New file\rule34_full\combined_full.parquet",
     ])
     output_dir: str = r"J:\New file\rule34_full\Images"
 
@@ -85,7 +80,13 @@ class Config:
     # General tags (e.g., appearance, actions, or objects)
     # "absurdly" will latch onto an exact string match.
     # Use "absurdly*" for prefix matching.
-    include_tags: List[str] = field(default_factory=lambda: ["*femboy*" ]) # <--
+    include_tags: List[str] = field(default_factory=lambda: ["*shemale*", "*cow*" "*futa*", "*futanari*", "*slime*", "*pokemon*", "*dickgirl*", "*pokephilia*", "*gardevoir*", "*monster_girl*", "*monster_boy*", 
+                                                            "thick_thighs", "*chastity_cage*", "*shortstack*", "*milking*", "insects", "horsecock", "*knot*", "ovipositor", "pregnant", "cat_ears", "catgirl", 
+                                                            "hair_over_one_eye", "*cat*", "*thighs*", "*eyes*", "*anus*", "knotted_penis", "stomach bulge", "bottomless", "dildo", "huge_breasts", "presenting",
+                                                              "*choker*", "electroworld", "*hair*", "*blush*", "catboy", "femboy_only", "monster_cock", "big_balls", "big_tit", "cumshot", "*cum*", "*pupils*",
+                                                                "*precum*", "*anal*", "*jewelry*", "looking_at_viewer", "bed_sheet", "medium_breasts", "*sex*", "*clothing*", "top-down bottom-up", "orc", "*skin*", "*horns*", "*ears*", "*breasts*",
+                                                                "goblin", "*anus*", "*bikini*", "feminine", "feminine", "*muscular*", "*breast*", "*eyelashes*", "*hair*", "*wet*", "*rabbit*", "*topless*", "*body*", "topless", "*body*", "*from*", "nipples", "*balls*", "*smile*"
+                                                                  ]) # <--
     exclude_tags: List[str] = field(default_factory=lambda: [  
         # --- Image Quality & Artifacts ---
         "lowres", "blurry", "pixelated", "jpeg artifacts", "compression artifacts",
@@ -114,7 +115,7 @@ class Config:
         # --- AI ---
         "ai generated", "ai art", "ai generated art", "ai generated image", "ai_generated", "ai_art",  "ai_artwork", "ai_image", "ai_artwork", "ai artifact", "ai*",
         # --- General Undesirables ---
-        "ugly", "grotesque"
+        "ugly", "grotesque", "loli*", "loli", "loli*", "loli art", "loli artwork", "loli image", "loli_art", "loli_artwork", "loli_image", "choose_your_own_adventure"
     ])
 
     # Character tags (add or remove character names)
@@ -130,9 +131,9 @@ class Config:
     exclude_artists: List[str] = field(default_factory=lambda: ["bob"])
 
     # Other filters
-    min_score: Optional[int] = 60 # <--
+    min_score: Optional[int] = 140 # <--
     ratings: List[str] = field(default_factory=lambda: ["safe", "general"])
-    square_only: bool = True # <--
+    square_only: bool = False # <--
     min_square_size: int = 1024 # <--
     min_width: int = 1024 # <--
     min_height: int = 1024 # <--

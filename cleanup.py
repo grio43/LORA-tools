@@ -68,7 +68,7 @@ def clean_dataset(directory_path, num_workers=4):
 
 if __name__ == "__main__":
     # Hardcoded directory path
-    target_directory = r"J:\New file\Danbooru2004\Images"
+    target_directory = r"J:\New file\rule34_full\Images"
 
     # You can adjust the number of workers based on your system's capabilities
     # A good starting point is the number of CPU cores you have.
