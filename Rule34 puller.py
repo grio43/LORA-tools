@@ -42,8 +42,8 @@ class Config:
     """Holds all runtime parameters (may be overridden from CLI)."""
 
     # ---- Paths ------------------------------------------------------------
-    metadata_db_path: str = r"J:\New file\Danbooru2004\metadata.parquet"
-    output_dir: str = r"J:\New file\Danbooru2004\Images"
+    metadata_db_path: str = r"J:\New file\rule34_full\rule34_full.parquet"
+    output_dir: str = r"J:\New file\rule34_full\Images"
 
     # ---- Hugging Face -----------------------------------------------------
     dataset_repo: str = "deepghs/danbooru2024"
@@ -51,22 +51,22 @@ class Config:
 
     # ---- Column names (aligns with DeepGHS conventions) -------------------
     tags_col: str = "tags"                      # Changed from "tag_string"
-    #character_tags_col: str = "tag_string_character"  # No change needed as filter is off
-    #copyright_tags_col: str = "tag_string_copyright"  # No change needed as filter is off
-    #artist_tags_col: str = "tag_string_artist"      # No change needed as filter is off
+    character_tags_col: str = "tag_string_character"  # No change needed as filter is off
+    copyright_tags_col: str = "tag_string_copyright"  # No change needed as filter is off
+    artist_tags_col: str = "tag_string_artist"      # No change needed as filter is off
     score_col: str = "score"
     rating_col: str = "rating"
     width_col: str = "width"                    # Changed from "image_width"
     height_col: str = "height"                  # Changed from "image_height"
-    file_path_col: str = "file_url"
+    file_path_col: str = "src_filename"
     id_col: str = "id"
 
     # ---- Filtering Toggles (Set to False to disable a filter group) ------
     enable_include_tags: bool = True
     enable_exclude_tags: bool = True
-    #enable_character_filtering: bool = False # <-- SET TO FALSE
-    #enable_copyright_filtering: bool = False # <-- SET TO FALSE
-    #enable_artist_filtering: bool = False # <-- SET TO FALSE
+    enable_character_filtering: bool = False # <-- SET TO FALSE
+    enable_copyright_filtering: bool = False # <-- SET TO FALSE
+    enable_artist_filtering: bool = False # <-- SET TO FALSE
     enable_score_filtering: bool = True
     enable_rating_filtering: bool = False
     enable_dimension_filtering: bool = True 
@@ -76,7 +76,7 @@ class Config:
     # General tags (e.g., appearance, actions, or objects)
     # "absurdly" will latch onto an exact string match.
     # Use "absurdly*" for prefix matching.
-    include_tags: List[str] = field(default_factory=lambda: ["*eye"]) # <--
+    include_tags: List[str] = field(default_factory=lambda: ["*femboy"]) # <--
     exclude_tags: List[str] = field(default_factory=lambda: [  
         # --- Image Quality & Artifacts ---
         "lowres", "blurry", "pixelated", "jpeg artifacts", "compression artifacts",
@@ -103,9 +103,9 @@ class Config:
         "monochrome", "grayscale",
 
         # --- AI ---
-        "ai generated", "ai art", "ai generated art", "ai generated image", "ai_generated", "ai_art",  "ai_artwork", "ai_image", "ai_artwork","ai artifact",
+        "ai generated", "ai art", "ai generated art", "ai generated image", "ai_generated", "ai_art",  "ai_artwork", "ai_image", "ai_artwork", "ai artifact", "ai*",
         # --- General Undesirables ---
-        "ugly", "grotesque", "loli", "loli_(style)", "loli_(character)", "lolicon", "loli", "Lolicon", "Lolicons", "shotacon", "shotacon_(style)", "shotacon_(character)", "shotacon", "Shotacon", "Shotacons"
+        "ugly", "grotesque"
     ])
 
     # Character tags (add or remove character names)
@@ -123,7 +123,7 @@ class Config:
     # Other filters
     min_score: Optional[int] = 30 # <--
     ratings: List[str] = field(default_factory=lambda: ["safe", "general"])
-    square_only: bool = False # <--
+    square_only: bool = True # <--
     min_square_size: int = 1024 # <--
     min_width: int = 1024 # <--
     min_height: int = 1024 # <--
@@ -319,6 +319,28 @@ def load_metadata(path: Path, cfg: Config) -> pd.DataFrame:
         df.reset_index(inplace=True)
     # --- END: ROBUST FIX ---
 
+    for col in (cfg.width_col, cfg.height_col, cfg.score_col):
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    def _normalise(series: pd.Series) -> pd.Series:
+        return (
+            series
+            .apply(lambda x: " ".join(x) if isinstance(x, (list, tuple, set)) else x)
+            .astype(str)
+            .str.lower()
+            .fillna("")
+        )
+
+    for col in (
+        cfg.tags_col,
+        cfg.character_tags_col,
+        cfg.copyright_tags_col,
+        cfg.artist_tags_col,
+    ):
+        if col in df.columns:
+            df[col] = _normalise(df[col])
+            
     return df
 
 def build_filter_mask(df: pd.DataFrame, cfg: Config) -> pd.Series:
@@ -342,30 +364,39 @@ def build_filter_mask(df: pd.DataFrame, cfg: Config) -> pd.Series:
         nonlocal mask
 
         def _create_pattern(tag: str) -> str:
-            """Generates a regex pattern based on wildcard usage in the tag."""
+            """Generates a robust regex pattern based on wildcard usage in the tag."""
             starts_with_star = tag.startswith('*')
             ends_with_star = tag.endswith('*')
             clean_tag = tag.strip('*')
             escaped_tag = re.escape(clean_tag)
 
-            # Case 1: Substring match (e.g., "*dog*")
+            # Case 1: Substring match (e.g., "*dog*") - no boundaries needed
             if starts_with_star and ends_with_star:
                 return escaped_tag
-            
+
+            # Boundary definitions using non-capturing groups to avoid look-behind errors.
+            # (?:^|\s) matches the start of the string or a space.
+            # (?:$|\s) matches the end of the string or a space.
+            prefix_boundary = r"(?:^|\s)"
+            suffix_boundary = r"(?:$|\s)"
+
             # Case 2: Prefix match (e.g., "dog*")
-            elif ends_with_star:
-                # Matches "dog_boy", "dogs", but not "good_dog"
-                return r"\b" + escaped_tag
+            if ends_with_star:
+                # Matches a tag that STARTS WITH the pattern.
+                # Example: "dog*" should match " dog_boy " but not "good_dog"
+                return prefix_boundary + escaped_tag
 
             # Case 3: Suffix match (e.g., "*dog")
             elif starts_with_star:
-                # Matches "good_dog", but not "dogs" or "dog_boy"
-                return escaped_tag + r"\b"
+                # Matches a tag that ENDS WITH the pattern.
+                # Example: "*dog" should match " good_dog " but not "dog_boy"
+                return escaped_tag + suffix_boundary
 
-            # Case 4: Exact whole-word match (e.g., "dog")
+            # Case 4: Exact whole-tag match (e.g., "dog" or "male/female")
             else:
-                # This is the most efficient pattern for exact matches.
-                return r"\b" + escaped_tag + r"\b"
+                # Matches the tag exactly, ensuring it's not part of a larger tag.
+                # Example: "dog" should match " dog " but not "dog_boy" or "good_dog"
+                return prefix_boundary + escaped_tag + suffix_boundary
 
         # Inclusion (AND logic): image must have ALL specified tags.
         if include_list:

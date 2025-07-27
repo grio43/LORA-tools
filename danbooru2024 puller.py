@@ -50,27 +50,27 @@ class Config:
     hf_auth_token: Optional[str] = os.getenv("Add token", None)  # Set your token here or use env var
 
     # ---- Column names (aligns with DeepGHS conventions) -------------------
-    tags_col: str = "tag_string"
-    character_tags_col: str = "tag_string_character"
-    copyright_tags_col: str = "tag_string_copyright"
-    artist_tags_col: str = "tag_string_artist"
+    tags_col: str = "tags"                      # Changed from "tag_string"
+    #character_tags_col: str = "tag_string_character"  # No change needed as filter is off
+    #copyright_tags_col: str = "tag_string_copyright"  # No change needed as filter is off
+    #artist_tags_col: str = "tag_string_artist"      # No change needed as filter is off
     score_col: str = "score"
     rating_col: str = "rating"
-    width_col: str = "image_width"
-    height_col: str = "image_height"
+    width_col: str = "width"                    # Changed from "image_width"
+    height_col: str = "height"                  # Changed from "image_height"
     file_path_col: str = "file_url"
     id_col: str = "id"
 
     # ---- Filtering Toggles (Set to False to disable a filter group) ------
-    enable_include_tags: bool = True      # <-- 
-    enable_exclude_tags: bool = True     # <-- 
-    enable_character_filtering: bool = False # <--
-    enable_copyright_filtering: bool = False # <--
-    enable_artist_filtering: bool = False # <--
-    enable_score_filtering: bool = True   # <-- 
-    enable_rating_filtering: bool = False # <--
-    enable_dimension_filtering: bool = True # <-- 
-    per_image_json: bool = True # <--
+    enable_include_tags: bool = True
+    enable_exclude_tags: bool = True
+    #enable_character_filtering: bool = False # <-- SET TO FALSE
+    #enable_copyright_filtering: bool = False # <-- SET TO FALSE
+    #enable_artist_filtering: bool = False # <-- SET TO FALSE
+    enable_score_filtering: bool = True
+    enable_rating_filtering: bool = False
+    enable_dimension_filtering: bool = True 
+    per_image_json: bool = True
 
     # ---- Filtering Criteria (with placeholders) ---------------------------
     # General tags (e.g., appearance, actions, or objects)
@@ -318,6 +318,33 @@ def load_metadata(path: Path, cfg: Config) -> pd.DataFrame:
         )
         df.reset_index(inplace=True)
     # --- END: ROBUST FIX ---
+
+        log.info("Normalizing data types for filtering...")
+
+    # Convert numeric columns, coercing errors to NaN
+    for col in (cfg.width_col, cfg.height_col, cfg.score_col):
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    # Helper function to normalize tag-like columns
+    def _normalise(series: pd.Series) -> pd.Series:
+        return (
+            series
+            .apply(lambda x: " ".join(x) if isinstance(x, (list, tuple, set)) else x)
+            .astype(str)
+            .str.lower()
+            .fillna("")
+        )
+
+    # Normalize all tag columns
+    for col in (
+        cfg.tags_col,
+        cfg.character_tags_col, # <-- Keep these commented if the filters are off
+        cfg.copyright_tags_col,
+        cfg.artist_tags_col,
+    ):
+        if col in df.columns:
+            df[col] = _normalise(df[col])
 
     return df
 
