@@ -1,5 +1,7 @@
 # LoRA Dataset Tools 🛠️
 
+All tools are based on a workflow using https://huggingface.co/deepghs datasets.
+
 Scripts that help you **collect, clean and prepare image datasets** for training
 LoRA / DreamBooth / SDXL finetunes.
 
