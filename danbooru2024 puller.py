@@ -105,7 +105,7 @@ class Config:
         # --- AI ---
         "ai generated", "ai art", "ai generated art", "ai generated image", "ai_generated", "ai_art",  "ai_artwork", "ai_image", "ai_artwork","ai artifact",
         # --- General Undesirables ---
-        "ugly", "grotesque"
+        "ugly", "grotesque", "loli*", "loli", "loli*", "loli art", "loli artwork", "loli image", "loli_art", "loli_artwork", "loli_image",
     ])
 
     # Character tags (add or remove character names)

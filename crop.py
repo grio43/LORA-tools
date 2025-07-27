@@ -4,6 +4,11 @@ import glob
 import sys
 import shutil
 import math
+import threading
+import keyboard # Using the 'keyboard' library for cross-platform hotkey support
+
+# --- Global flag for soft stop ---
+stop_requested = False
 
 # ---------- USER SETTINGS ---------------------------------
 # 💾 Place the images you want to crop in this folder.
@@ -19,11 +24,13 @@ EXTENSIONS = ["*.jpg", "*.jpeg", "*.png", "*.tif", "*.bmp"]
 MIN_SIZE = 1024
 
 # 📈 Multi-Crop Trigger Factor.
-MULTI_CROP_THRESHOLD_FACTOR = 1.1
+MULTI_CROP_THRESHOLD_FACTOR = 1.25
 
 # 📐 Overlap percentage for sequential crops.
-OVERLAP_PERCENT = 0.1
+OVERLAP_PERCENT = 0.18
 
+#  Hotkey to signal a stop after the current file is processed.
+STOP_KEY = 'q'
 # ----------------------------------------------------------
 # The interactive preview has been removed for bulk processing.
 # ----------------------------------------------------------
@@ -77,8 +84,22 @@ def generate_controlled_rois(img_w, img_h, min_size, overlap_percent, threshold_
 
     return rois
 
+def hotkey_listener():
+    """Waits for the stop key to be pressed and sets the global stop_requested flag."""
+    global stop_requested
+    keyboard.wait(STOP_KEY)
+    stop_requested = True
+    print(f"\n🛑 Stop requested. The script will halt after finishing the current file. 🛑")
+
+
 def main():
     """Main function to iterate through images, generate controlled crops, and save them."""
+    
+    # Start the hotkey listener in a separate thread
+    print(f"Press '{STOP_KEY}' at any time to gracefully stop the script after the current file.")
+    listener_thread = threading.Thread(target=hotkey_listener, daemon=True)
+    listener_thread.start()
+
     files = list_files(SOURCE_FOLDER, EXTENSIONS)
     if not files:
         print(f"❌ No images found – check your SOURCE_FOLDER path or EXTENSIONS list.\nSOURCE_FOLDER: {SOURCE_FOLDER}")
@@ -87,6 +108,11 @@ def main():
     os.makedirs(MULTI_CROP_FOLDER, exist_ok=True)
 
     for idx, fpath in enumerate(files):
+        # Check if a stop has been requested before processing the next file
+        if stop_requested:
+            print("\nSoft stop initiated. Halting processing.")
+            break
+
         try:
             base_name_with_ext = os.path.basename(fpath)
             print(f"\n[{idx + 1}/{len(files)}] Processing {base_name_with_ext}")
@@ -153,3 +179,7 @@ if __name__ == "__main__":
         main()
     except KeyboardInterrupt:
         sys.exit("\nInterrupted by user. Exiting.")
+    except ImportError:
+        print("\nError: The 'keyboard' library is required for the hotkey feature.")
+        print("Please install it by running: pip install keyboard")
+        sys.exit(1)

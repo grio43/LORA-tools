@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional
 
-import polars as pl
+import pandas as pd
 from huggingface_hub import HfFolder, login
 
 try:
@@ -44,11 +44,6 @@ class Config:
     # ---- Paths ------------------------------------------------------------
     metadata_db_paths: List[str] = field(default_factory=lambda: [
         r"J:\New file\rule34_full\table-1.parquet",
-        r"J:\New file\rule34_full\table-2.parquet",
-        r"J:\New file\rule34_full\table-3.parquet",
-        r"J:\New file\rule34_full\table-4.parquet",
-        r"J:\New file\rule34_full\table-5.parquet",
-        r"J:\New file\rule34_full\table-6.parquet",
     ])
     output_dir: str = r"J:\New file\rule34_full\Images"
 
@@ -58,10 +53,9 @@ class Config:
 
     # ---- Column names (aligns with DeepGHS conventions) -------------------
     tags_col: str = "tags"                      # Changed from "tag_string"
-    # The following columns do not exist in the new dataset
-    # character_tags_col: str = "tag_string_character"
-    # copyright_tags_col: str = "tag_string_copyright"
-    # artist_tags_col: str = "tag_string_artist"
+    character_tags_col: str = "tag_string_character"  # No change needed as filter is off
+    copyright_tags_col: str = "tag_string_copyright"  # No change needed as filter is off
+    artist_tags_col: str = "tag_string_artist"      # No change needed as filter is off
     score_col: str = "score"
     rating_col: str = "rating"
     width_col: str = "width"                    # Changed from "image_width"
@@ -72,7 +66,6 @@ class Config:
     # ---- Filtering Toggles (Set to False to disable a filter group) ------
     enable_include_tags: bool = True
     enable_exclude_tags: bool = True
-    enable_include_Any_tags: bool = True  # <-- Set to True to enable "include any" tag filtering
     enable_character_filtering: bool = False # <-- SET TO FALSE
     enable_copyright_filtering: bool = False # <-- SET TO FALSE
     enable_artist_filtering: bool = False # <-- SET TO FALSE
@@ -85,7 +78,7 @@ class Config:
     # General tags (e.g., appearance, actions, or objects)
     # "absurdly" will latch onto an exact string match.
     # Use "absurdly*" for prefix matching.
-    include_tags: List[str] = field(default_factory=lambda: ["*femboy*" ]) # <--
+    include_tags: List[str] = field(default_factory=lambda: ["*femboy"]) # <--
     exclude_tags: List[str] = field(default_factory=lambda: [  
         # --- Image Quality & Artifacts ---
         "lowres", "blurry", "pixelated", "jpeg artifacts", "compression artifacts",
@@ -249,195 +242,222 @@ def apply_cli_overrides(args: argparse.Namespace, cfg: Config) -> None:
 # ---------------------------------------------------------------------------
 # Metadata loading & filtering
 # ---------------------------------------------------------------------------
-def load_metadata(paths: List[Path], cfg: Config) -> pl.LazyFrame:
-    """Loads and concatenates one or more parquet files into a single LazyFrame."""
+def load_metadata(paths: List[Path], cfg: Config) -> pd.DataFrame:
+    """Loads and concatenates one or more parquet files into a single DataFrame."""
+    # This block is now at the TOP of the function.
+    # It defines all columns we might need from ANY of the files.
     cols_to_load = set()
     if (cfg.enable_include_tags or cfg.enable_exclude_tags or
          (cfg.save_filtered_metadata and cfg.per_image_json)):
         cols_to_load.add(cfg.tags_col)
-    # The character, copyright, and artist columns are disabled as they do not exist.
-    # if cfg.enable_character_filtering or (cfg.save_filtered_metadata and cfg.per_image_json):
-    #     cols_to_load.add(cfg.character_tags_col)
-    # if cfg.enable_copyright_filtering: cols_to_load.add(cfg.copyright_tags_col)
-    # if cfg.enable_artist_filtering or (cfg.save_filtered_metadata and cfg.per_image_json):
-    #     cols_to_load.add(cfg.artist_tags_col)
+    if cfg.enable_character_filtering or (cfg.save_filtered_metadata and cfg.per_image_json):
+        cols_to_load.add(cfg.character_tags_col)
+    if cfg.enable_copyright_filtering: cols_to_load.add(cfg.copyright_tags_col)
+    if cfg.enable_artist_filtering or (cfg.save_filtered_metadata and cfg.per_image_json):
+        cols_to_load.add(cfg.artist_tags_col)
     if cfg.enable_score_filtering: cols_to_load.add(cfg.score_col)
     if cfg.enable_rating_filtering: cols_to_load.add(cfg.rating_col)
     if cfg.enable_dimension_filtering: cols_to_load.update([cfg.width_col, cfg.height_col])
     if cfg.download_images:
-        cols_to_load.update([cfg.id_col, cfg.file_path_col])
+        cols_to_load.add(cfg.id_col)
+        cols_to_load.add(cfg.file_path_col)
     if cfg.save_filtered_metadata:
         cols_to_load.add(cfg.file_path_col)
 
-    log.info("📖 Scanning metadata from multiple files...")
-    valid_paths = [p for p in paths if p.exists()]
-    if not valid_paths:
-        log.error("❌ No valid metadata files could be found. Please check paths. Exiting.")
+    # We now loop through each path provided in the config.
+    df_list = []
+    log.info("📖 Loading metadata from multiple files...")
+    import pyarrow.parquet as pq
+
+    for path in paths:
+        if not path.exists():
+            log.warning(f"⚠️ Metadata path not found, skipping: {path}")
+            continue
+
+        try:
+            log.info(f"   -> Reading {path}")
+            # The schema inspection now happens INSIDE the loop for each file.
+            parquet_schema = pq.read_schema(path)
+            available_cols_in_file = [field.name for field in parquet_schema]
+            final_cols_for_file = list(cols_to_load.intersection(available_cols_in_file))
+            
+            if not final_cols_for_file:
+                log.warning(f"   -> No requested columns found in {path}. Skipping file.")
+                continue
+
+            # Load only the necessary and available columns from the current file.
+            df_part = pd.read_parquet(path, columns=final_cols_for_file)
+            df_list.append(df_part)
+        except Exception as e:
+            log.error(f"❌ Failed to load metadata from {path}: {e}")
+            continue # Skip to the next file
+
+    if not df_list:
+        log.error("❌ No valid metadata files could be loaded. Please check the paths in your config or --metadata argument. Exiting.")
         sys.exit(1)
 
-    # Lazily scan all parquet files. Polars handles concatenation.
-    try:
-        lf = pl.concat(
-            [pl.scan_parquet(p) for p in valid_paths],
-            how="vertical_relaxed"
+    # All files are loaded. Now, combine them into one big DataFrame.
+    log.info("   Concatenating loaded dataframes...")
+    df = pd.concat(df_list, ignore_index=True, sort=False)
+
+    # The critical check for the 'id' column now happens AFTER concatenation,
+    # on the final, combined DataFrame.
+    if cfg.download_images and cfg.id_col not in df.columns:
+        log.error(f"❌ CRITICAL ERROR: The required ID column '{cfg.id_col}' was not found in any loaded metadata files.")
+        log.error("Please ensure at least one of your parquet files contains this column and that `id_col` is set correctly in the script's Config.")
+        sys.exit(1)
+
+    # The rest of the processing (normalization, type conversion) happens on the combined DataFrame.
+    for col in (cfg.width_col, cfg.height_col, cfg.score_col):
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    def _normalise(series: pd.Series) -> pd.Series:
+        return (
+            series
+            .apply(lambda x: " ".join(x) if isinstance(x, (list, tuple, set)) else x)
+            .astype(str)
+            .str.lower()
+            .fillna("")
         )
-        # Select columns after the scan to maintain lazy evaluation
-        if cols_to_load:
-             lf = lf.select(list(cols_to_load))
-    except Exception as e:
-        log.error(f"❌ Failed to scan Parquet files: {e}")
-        log.error("Please ensure files are not corrupt and column names in config are correct.")
-        sys.exit(1)
 
+    for col in (cfg.tags_col, cfg.character_tags_col, cfg.copyright_tags_col, cfg.artist_tags_col):
+        if col in df.columns:
+            df[col] = _normalise(df[col])
+            
+    return df
 
-    # Numeric conversions
-# Define transformations to apply lazily
-    transformations = []
-    
-    # Numeric conversions
-    for col_name in (cfg.width_col, cfg.height_col, cfg.score_col):
-        if col_name in lf.columns:
-            # This robustly handles type mismatches (e.g., Int64 vs. Float64) across files.
-            transformations.append(
-                pl.col(col_name)
-                .cast(pl.Float64, strict=False)
-                .fill_null(0)
-                .cast(pl.Int64)
-            )
+def build_filter_mask(df: pd.DataFrame, cfg: Config) -> pd.Series:
+    """Return boolean mask for rows matching cfg filters."""
+    mask = pd.Series(True, index=df.index)
+    log.info
 
-    # String normalization
-    for col_name in [cfg.tags_col]:
-        if col_name in lf.columns:
-            transformations.append(
-                pl.col(col_name)
-                .cast(pl.String) # Ensure it's string type
-                .str.to_lowercase()
-                .fill_null("")
-            )
+    # --- File Type Filtering -----------------------------------------
+    if cfg.file_path_col in df.columns:
+        excluded_extensions = ('.zip', '.mp4', '.webm', '.swf')
+        log.info(f"    Excluding files with extensions: {', '.join(excluded_extensions)}")
+        mask &= ~df[cfg.file_path_col].str.lower().str.endswith(excluded_extensions, na=False)
 
-    # Apply all transformations at once
-    if transformations:
-        lf = lf.with_columns(transformations)
-        
-    if cfg.download_images and cfg.id_col not in lf.columns:
-        log.error(f"❌ CRITICAL ERROR: The required ID column '{cfg.id_col}' was not found.")
-        sys.exit(1)
-        
-    return lf
-
+    if cfg.exclude_gifs and cfg.file_path_col in df.columns:
+        log.info("    Excluding .gif files from download list.")
+        mask &= ~df[cfg.file_path_col].str.lower().str.endswith('.gif', na=False)
 
     # --- Tag-based Filtering -----------------------------------------
 # Helper function to avoid code repetition
-def build_filter_mask(lf: pl.LazyFrame, cfg: Config) -> pl.LazyFrame:
-    """
-    Applies all configured filters to the LazyFrame and returns a new,
-    filtered LazyFrame.
-    """
-    log.info("📝 Building filter query...")
-    expressions = []
+    def apply_tag_filters(series: pd.Series, include_list: List[str], exclude_list: List[str], log_name: str):
+        nonlocal mask
 
-    # --- Helper for Tag Filtering ---
-    def _create_pattern(tag: str) -> str:
-        """Generates a robust regex pattern based on wildcard usage in the tag."""
-        starts_with_star = tag.startswith('*')
-        ends_with_star = tag.endswith('*')
-        clean_tag = tag.strip('*')
-        escaped_tag = re.escape(clean_tag)
-        prefix_boundary = r"(?:^|\s)"
-        suffix_boundary = r"(?:$|\s)"
+        def _create_pattern(tag: str) -> str:
+            """Generates a robust regex pattern based on wildcard usage in the tag."""
+            starts_with_star = tag.startswith('*')
+            ends_with_star = tag.endswith('*')
+            clean_tag = tag.strip('*')
+            escaped_tag = re.escape(clean_tag)
 
-        if starts_with_star and ends_with_star: return escaped_tag
-        if ends_with_star: return prefix_boundary + escaped_tag
-        if starts_with_star: return escaped_tag + suffix_boundary
-        return prefix_boundary + escaped_tag + suffix_boundary
+            # Case 1: Substring match (e.g., "*dog*") - no boundaries needed
+            if starts_with_star and ends_with_star:
+                return escaped_tag
 
-    def apply_tag_filters(
-        base_lf: pl.LazyFrame,
-        col_name: str,
-        include_list: List[str],
-        exclude_list: List[str],
-        log_name: str
-    ) -> pl.LazyFrame:
-        """Applies inclusion and exclusion regex filters to a column."""
-        if col_name not in base_lf.columns:
-            log.warning(f"'{col_name}' not found. Skipping {log_name} filtering.")
-            return base_lf
+            # Boundary definitions using non-capturing groups to avoid look-behind errors.
+            # (?:^|\s) matches the start of the string or a space.
+            # (?:$|\s) matches the end of the string or a space.
+            prefix_boundary = r"(?:^|\s)"
+            suffix_boundary = r"(?:$|\s)"
 
-        # Inclusion
-        if include_list:
-            # ANY logic (more common and efficient)
-            if cfg.enable_include_Any_tags:
-                log.info(f"    Including {log_name} (ANY required): {include_list}")
-                patterns = [_create_pattern(tag) for tag in include_list if tag]
-                if patterns:
-                    final_pattern = "|".join(patterns)
-                    base_lf = base_lf.filter(pl.col(col_name).str.contains(final_pattern))
-            # ALL logic
+            # Case 2: Prefix match (e.g., "dog*")
+            if ends_with_star:
+                # Matches a tag that STARTS WITH the pattern.
+                # Example: "dog*" should match " dog_boy " but not "good_dog"
+                return prefix_boundary + escaped_tag
+
+            # Case 3: Suffix match (e.g., "*dog")
+            elif starts_with_star:
+                # Matches a tag that ENDS WITH the pattern.
+                # Example: "*dog" should match " good_dog " but not "dog_boy"
+                return escaped_tag + suffix_boundary
+
+            # Case 4: Exact whole-tag match (e.g., "dog" or "male/female")
             else:
-                log.info(f"    Including {log_name} (ALL required): {include_list}")
-                # FIX: Use pl.all_horizontal for a more optimized query
-                patterns = [_create_pattern(tag) for tag in include_list if tag]
-                if patterns:
-                    all_conditions = [pl.col(col_name).str.contains(p) for p in patterns]
-                    base_lf = base_lf.filter(pl.all_horizontal(all_conditions))
+                # Matches the tag exactly, ensuring it's not part of a larger tag.
+                # Example: "dog" should match " dog " but not "dog_boy" or "good_dog"
+                return prefix_boundary + escaped_tag + suffix_boundary
 
-        # Exclusion (ANY match excludes the row)
+        # Inclusion (AND logic): image must have ALL specified tags.
+        if include_list:
+            log.info(f"    Including {log_name} (ALL required): {include_list}")
+            for tag in include_list:
+                if not tag: continue # Skip empty strings
+                pattern = _create_pattern(tag)
+                mask &= series.str.contains(pattern, regex=True, na=False, flags=re.IGNORECASE)
+
+        # Exclusion (OR logic): image must not have ANY of these tags.
         if exclude_list:
             log.info(f"    Excluding {log_name} (ANY will be excluded): {exclude_list}")
+            
+            # Combine all non-empty exclusion patterns into a single regex with '|'.
+            # This is more efficient than applying .str.contains in a loop.
             patterns = [_create_pattern(tag) for tag in exclude_list if tag]
+            
             if patterns:
                 final_pattern = "|".join(patterns)
-                base_lf = base_lf.filter(~pl.col(col_name).str.contains(final_pattern))
-        
-        return base_lf
+                mask &= ~series.str.contains(final_pattern, regex=True, na=False, flags=re.IGNORECASE)
 
-    # --- File Type Filtering ---
-    # --- File Type Filtering ---
-    if cfg.file_path_col in lf.columns:
-        log.info("    Excluding files with extensions: .zip, .mp4, .webm, .swf")
-        # FIX: Chain the filters individually
-        lf = lf.filter(~pl.col(cfg.file_path_col).str.contains(r'\.(zip|mp4|webm|swf|gif)$'))
-
-        if cfg.exclude_gifs:
-            log.info("    Excluding .gif files.")
-            lf = lf.filter(~pl.col(cfg.file_path_col).str.ends_with('.gif'))
-
-    # --- Tag-based Filtering ---
+    # General Tags
     if cfg.enable_include_tags or cfg.enable_exclude_tags:
-        lf = apply_tag_filters(lf, cfg.tags_col, cfg.include_tags if cfg.enable_include_tags else [], cfg.exclude_tags if cfg.enable_exclude_tags else [], "general tags")
-    if cfg.enable_copyright_filtering:
-        lf = apply_tag_filters(lf, cfg.copyright_tags_col, cfg.include_copyrights, cfg.exclude_copyrights, "copyrights")
-    if cfg.enable_artist_filtering:
-        lf = apply_tag_filters(lf, cfg.artist_tags_col, cfg.include_artists, cfg.exclude_artists, "artists")
+        if cfg.tags_col in df.columns:
+            tag_series = df[cfg.tags_col].str.lower().fillna("")
+            
+            # Conditionally create the lists to pass to the helper function
+            include_list = cfg.include_tags if cfg.enable_include_tags else []
+            exclude_list = cfg.exclude_tags if cfg.enable_exclude_tags else []
+            
+            # Only call the function if there's actually something to do
+            if include_list or exclude_list:
+                apply_tag_filters(tag_series, include_list, exclude_list, "general tags")
+        else:
+            log.warning(f"'{cfg.tags_col}' not found. Skipping general tag filtering.")
 
-    # --- Metadata Filtering ---
+    # Copyright Tags
+    if cfg.enable_copyright_filtering:
+        if cfg.copyright_tags_col in df.columns:
+            copy_series = df[cfg.copyright_tags_col].str.lower().fillna("")
+            apply_tag_filters(copy_series, cfg.include_copyrights, cfg.exclude_copyrights, "copyrights")
+        else:
+            log.warning(f"'{cfg.copyright_tags_col}' not found. Skipping copyright filtering.")
+
+    # Artist Tags
+    if cfg.enable_artist_filtering:
+        if cfg.artist_tags_col in df.columns:
+            artist_series = df[cfg.artist_tags_col].str.lower().fillna("")
+            apply_tag_filters(artist_series, cfg.include_artists, cfg.exclude_artists, "artists")
+        else:
+            log.warning(f"'{cfg.artist_tags_col}' not found. Skipping artist filtering.")
+
+    # --- Metadata Filtering ------------------------------------------
+    # Score
     if cfg.enable_score_filtering and cfg.min_score is not None:
         log.info(f"    Filtering for score >= {cfg.min_score}")
-        expressions.append(pl.col(cfg.score_col) >= cfg.min_score)
+        mask &= df[cfg.score_col].fillna(0) >= cfg.min_score
+
+    # Ratings
     if cfg.enable_rating_filtering and cfg.ratings:
         log.info(f"    Filtering for ratings: {cfg.ratings}")
-        expressions.append(pl.col(cfg.rating_col).is_in(cfg.ratings))
-    
+        mask &= df[cfg.rating_col].fillna("").isin(cfg.ratings)
+
+    # Dimensions
     if cfg.enable_dimension_filtering:
-        w, h = pl.col(cfg.width_col), pl.col(cfg.height_col)
+        w, h = df[cfg.width_col], df[cfg.height_col]
         if cfg.square_only:
             log.info(f"    Filtering for square images >= {cfg.min_square_size}px.")
-            expressions.extend([
-                w == h,
-                w >= cfg.min_square_size
-            ])
+            mask &= (w == h) & (w >= cfg.min_square_size)
         else:
             log.info(f"    Filtering for dimensions: {cfg.min_width}x{cfg.min_height} to {cfg.max_width}x{cfg.max_height}")
-            if cfg.min_width > 0: expressions.append(w >= cfg.min_width)
-            if cfg.min_height > 0: expressions.append(h >= cfg.min_height)
-            if cfg.max_width > 0: expressions.append(w <= cfg.max_width)
-            if cfg.max_height > 0: expressions.append(h <= cfg.max_height)
+            if cfg.min_width > 0: mask &= w >= cfg.min_width
+            if cfg.min_height > 0: mask &= h >= cfg.min_height
+            if cfg.max_width > 0: mask &= w <= cfg.max_width
+            if cfg.max_height > 0: mask &= h <= cfg.max_height
             
-    # Apply all collected expressions at once
-    if expressions:
-        lf = lf.filter(pl.all_horizontal(expressions))
-        
-    return lf
+    return mask
 
 # ---------------------------------------------------------------------------
 # Output and Download Helpers
@@ -491,9 +511,8 @@ def save_filtered_metadata(df: pd.DataFrame, cfg: Config, dest_dir: Path) -> Non
             if cfg.filtered_metadata_format == "json":
                 df_to_save.to_json(outfile, orient="records", lines=True, force_ascii=False)
             elif cfg.filtered_metadata_format == "txt":
-                # The .txt output only contains file paths. 
-                # Use df_to_save to ensure consistency with the JSON path.
-                df_to_save[cfg.file_path_col].to_csv(outfile, index=False, header=False)
+                # The .txt output only contains file paths, so no changes needed here.
+                df[cfg.file_path_col].to_csv(outfile, index=False, header=False)
 
             log.info(f"💾 Filtered metadata saved → {outfile}")
 
@@ -507,15 +526,10 @@ def download_with_datapool(df: pd.DataFrame, cfg: Config, dst: Path) -> None:
         log.error("CheeseChaser is not installed. Install with 'pip install cheesechaser'.")
         log.error("Alternatively, use --no-download to skip this step.")
         return
-    
-    # FIX: Initialize DataPool with the configured repository
-    log.info(f"Initializing DataPool with repository: {cfg.dataset_repo}")
+
     pool = DataPool()
-    
     ids = df[cfg.id_col].tolist()
     log.info(f"Starting DataPool download of {len(ids)} images to {dst}...")
-    
-    # FIX: Correctly call the download method with all arguments
     pool.batch_download_to_directory(
         resource_ids=ids,
         dst_dir=dst,
@@ -567,16 +581,11 @@ def main() -> None:
         verify_hf_auth(cfg)
 
     # --- Load and Filter Data ---
-    lf = load_metadata(meta_paths, cfg)
+    df = load_metadata(meta_paths, cfg)
+    log.info(f"Loaded {len(df):,} records.")
 
-    # build_filter_mask now returns a new, filtered LazyFrame
-    lf_filtered = build_filter_mask(lf, cfg)
-
-    # --- Execute the query and get results ---
-    log.info("🚀 Executing filter query... (This may take a moment on large datasets)")
-    # .collect() runs the query. .to_pandas() converts the result for the rest of the script.
-    df_sub = lf_filtered.collect().to_pandas()
-    log.info("✅ Query complete.")
+    mask = build_filter_mask(df, cfg)
+    df_sub = df[mask].reset_index(drop=True)
 
     match_count = len(df_sub)
     log.info(f"✅ Found {match_count:,} records matching your criteria.")
