@@ -1,5 +1,4 @@
 import os
-import os
 import json
 import shutil
 
@@ -97,15 +96,15 @@ def process_and_organize_files(source_dir, processed_dir, backup_dir):
 
 # 1. The folder containing your original images and original .json files.
 #    Example: "C:/Users/YourUser/Desktop/MyDataset"
-SOURCE_DIRECTORY = "C:/path/to/source_data"
+SOURCE_DIRECTORY = r"J:\New file\Ready for captions without tags"
 
 # 2. The folder where the new, transformed .json files will be saved.
 #    Example: "D:/Processed_JSONs"
-PROCESSED_DIRECTORY = "C:/path/to/processed_output"
+PROCESSED_DIRECTORY = r"J:\New file\json_processed"
 
 # 3. The folder where the original .json files will be moved for backup.
 #    Example: "D:/Backup_JSONs"
-BACKUP_DIRECTORY = "C:/path/to/backup_originals"
+BACKUP_DIRECTORY = r"J:\New file\json_backup"
 
 # --------------------------------------------------
 

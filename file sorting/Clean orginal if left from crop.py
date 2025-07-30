@@ -14,7 +14,7 @@ EXTENSIONS = ["*.jpg", "*.jpeg", "*.png", "*.tif", "*.bmp"]
 # --- DANGER ZONE ---
 # Set to True to actually delete files. 
 # It is STRONGLY recommended to run with False first to see what will be deleted.
-PERFORM_DELETION = True
+PERFORM_DELETION = False
 # ---------------------------------------------------------------------
 
 def list_files(folder, patterns):
