@@ -1,0 +1,9 @@
+torch>=2.1
+safetensors
+timm==0.9.12
+deepspeed==0.14.1
+huggingface_hub>=0.23
+pillow
+numpy
+tqdm
+pandas

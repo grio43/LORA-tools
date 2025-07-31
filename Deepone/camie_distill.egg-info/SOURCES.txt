@@ -1,0 +1,8 @@
+pyproject.toml
+setup.cfg
+camie_distill.egg-info/PKG-INFO
+camie_distill.egg-info/SOURCES.txt
+camie_distill.egg-info/dependency_links.txt
+camie_distill.egg-info/entry_points.txt
+camie_distill.egg-info/requires.txt
+camie_distill.egg-info/top_level.txt

@@ -1,0 +1,23 @@
+Metadata-Version: 2.4
+Name: camie_distill
+Version: 0.1.0
+Summary: Student-teacher distillation toolkit for Camie-Tagger
+Home-page: https://github.com/yourname/camie_distill
+Author: Your Name
+Author-email: you@example.com
+License: Apache-2.0
+Keywords: deep-learning,vision,multilabel,distillation,huggingface
+Classifier: Programming Language :: Python :: 3
+Classifier: License :: OSI Approved :: Apache Software License
+Classifier: Operating System :: OS Independent
+Requires-Python: >=3.9
+Description-Content-Type: text/markdown
+Requires-Dist: torch>=2.1
+Requires-Dist: safetensors
+Requires-Dist: timm==0.9.12
+Requires-Dist: deepspeed==0.14.1
+Requires-Dist: huggingface_hub>=0.23
+Requires-Dist: pillow
+Requires-Dist: numpy
+Requires-Dist: tqdm
+Requires-Dist: pandas
