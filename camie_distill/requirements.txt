@@ -1,0 +1,10 @@
+torch>=2.1
+torchvision
+timm==0.9.12
+deepspeed==0.14.1
+huggingface_hub>=0.23
+safetensors
+pillow
+numpy
+tqdm
+
