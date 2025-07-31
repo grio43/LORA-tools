@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-A script to filter the Danbooru dataset based on metadata criteria
+A script to filter the R34 dataset based on metadata criteria
 and optionally download the matching images using the cheesechaser library.
 """
 
