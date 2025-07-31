@@ -1,14 +1,12 @@
-[build-system]
-requires = ["setuptools>=68", "wheel"]
-build-backend = "setuptools.build_meta"
-
 [project]
 name = "camie_distill"
-version = "0.1.0"                    # <- string, as required by the spec
+version = "0.1.0"
 description = "Student‑teacher distillation toolkit for Camie‑Tagger"
-readme = "README.md"
-requires-python = ">=3.10"
 
+# One directory up from Deepone/
+readme = { file = "../README.md", content-type = "text/markdown" }
+
+requires-python = ">=3.10"
 dependencies = [
     "torch>=2.1",
     "timm==0.9.12",

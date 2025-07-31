@@ -1,22 +1,27 @@
+# Deepone/setup.py
 from pathlib import Path
-
 from setuptools import find_packages, setup
 
-# -------------------------------------------------
-# Core metadata — every literal must be *quoted*
-# -------------------------------------------------
-PACKAGE_NAME = "camie_distill"
-VERSION = "0.1.0"        # <- quotes added; 0.1.0 without quotes is illegal Python
-DESCRIPTION = "Student‑teacher distillation toolkit for Camie‑Tagger"
+ROOT = Path(__file__).resolve().parent
 
-THIS_DIR = Path(__file__).parent
-LONG_DESCRIPTION = (THIS_DIR / "README.md").read_text(encoding="utf-8")
+# ------------------------------------------------------------------
+# Robust long‑description loader — will not crash if README is absent
+# ------------------------------------------------------------------
+def read_long_description() -> str:
+    """
+    Search for a README.md in the current folder or one directory
+    above; return an empty string if nothing is found.
+    """
+    for candidate in (ROOT / "README.md", ROOT.parent / "README.md"):
+        if candidate.is_file():
+            return candidate.read_text(encoding="utf-8")
+    return ""  # fallback keeps 'pip install' alive
 
 setup(
-    name=PACKAGE_NAME,
-    version=VERSION,
-    description=DESCRIPTION,
-    long_description=LONG_DESCRIPTION,
+    name="camie_distill",
+    version="0.1.0",
+    description="Student‑teacher distillation toolkit for Camie‑Tagger",
+    long_description=read_long_description(),
     long_description_content_type="text/markdown",
     python_requires=">=3.10",
     packages=find_packages(exclude=("tests", "examples")),
@@ -24,13 +29,7 @@ setup(
         "torch>=2.1",
         "timm==0.9.12",
         "safetensors>=0.5.3",
-        # Use the pre‑built wheel on Windows; comment out if you *must* build from source
         "deepspeed>=0.16.3,<0.17",
-    ],
-    classifiers=[
-        "Programming Language :: Python :: 3",
-        "Operating System :: Microsoft :: Windows :: Windows 10",
-        "License :: OSI Approved :: MIT License",
     ],
     include_package_data=True,
     zip_safe=False,
