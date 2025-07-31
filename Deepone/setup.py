@@ -1,43 +1,37 @@
-[metadata]
-name = camie_distill
-version = 0.1.0
-author = Your Name
-author_email = you@example.com
-url = https://github.com/yourname/camie_distill
-description = "Student‑teacher distillation toolkit for Camie‑Tagger"
-long_description = file: README.md          # make sure README.md exists here
-long_description_content_type = text/markdown
-license = Apache-2.0
-classifiers =
-    Programming Language :: Python :: 3
-    License :: OSI Approved :: Apache Software License
-    Operating System :: OS Independent
-keywords = deep-learning, vision, multilabel, distillation, huggingface
+from pathlib import Path
 
-[options]
-python_requires = >=3.9
-packages = find:
-include_package_data = True
+from setuptools import find_packages, setup
 
-install_requires =
-    torch>=2.1
-    safetensors
-    timm==0.9.12
-    deepspeed==0.14.1
-    huggingface_hub>=0.23
-    pillow
-    numpy
-    tqdm
-    pandas
+# -------------------------------------------------
+# Core metadata — every literal must be *quoted*
+# -------------------------------------------------
+PACKAGE_NAME = "camie_distill"
+VERSION = "0.1.0"        # <- quotes added; 0.1.0 without quotes is illegal Python
+DESCRIPTION = "Student‑teacher distillation toolkit for Camie‑Tagger"
 
-[options.packages.find]
-where = .
-exclude =
-    tests*
-    docs*
-    examples*
+THIS_DIR = Path(__file__).parent
+LONG_DESCRIPTION = (THIS_DIR / "README.md").read_text(encoding="utf-8")
 
-[options.entry_points]
-console_scripts =
-    camie-build-dataset = camie_distill.dataset_builder:build_dataset
-    camie-train-student = camie_distill.train_student:main
+setup(
+    name=PACKAGE_NAME,
+    version=VERSION,
+    description=DESCRIPTION,
+    long_description=LONG_DESCRIPTION,
+    long_description_content_type="text/markdown",
+    python_requires=">=3.10",
+    packages=find_packages(exclude=("tests", "examples")),
+    install_requires=[
+        "torch>=2.1",
+        "timm==0.9.12",
+        "safetensors>=0.5.3",
+        # Use the pre‑built wheel on Windows; comment out if you *must* build from source
+        "deepspeed>=0.16.3,<0.17",
+    ],
+    classifiers=[
+        "Programming Language :: Python :: 3",
+        "Operating System :: Microsoft :: Windows :: Windows 10",
+        "License :: OSI Approved :: MIT License",
+    ],
+    include_package_data=True,
+    zip_safe=False,
+)
