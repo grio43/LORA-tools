@@ -1,5 +1,5 @@
 [project]
-name = "camie_distill"
+dynamic = ["classifiers", "keywords", "license", "authors", "scripts"] = "camie_distill"
 version = "0.1.0"
 description = "Student‑teacher distillation toolkit for Camie‑Tagger"
 
