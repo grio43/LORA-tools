@@ -1,3 +1,0 @@
-[console_scripts]
-camie-build-dataset = camie_distill.dataset_builder:build_dataset
-camie-train-student = camie_distill.train_student:main
