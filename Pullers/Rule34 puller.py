@@ -43,9 +43,9 @@ class Config:
 
     # ---- Paths ------------------------------------------------------------
     metadata_db_paths: List[str] = field(default_factory=lambda: [
-        r"J:\New file\rule34_full\combined_full.parquet",
+        r"/media/andrewk/qnap-public/New file/rule34_full/combined_full.parquet",
     ])
-    output_dir: str = r"J:\New file\rule34_full\Images"
+    output_dir: str = r"/mnt/raid0/Test"
 
     # ---- Hugging Face -----------------------------------------------------
     dataset_repo: str = "deepghs/rule34_full"
@@ -65,27 +65,22 @@ class Config:
     id_col: str = "id"
 
     # ---- Filtering Toggles (Set to False to disable a filter group) ------
-    enable_include_tags: bool = True
-    enable_exclude_tags: bool = True
-    enable_include_Any_tags: bool = True  # <-- Set to True to enable "include any" tag filtering
+    enable_include_tags: bool = False
+    enable_exclude_tags: bool = False
+    enable_include_Any_tags: bool = False  # <-- Set to True to enable "include any" tag filtering
     enable_character_filtering: bool = False # <-- SET TO FALSE
     enable_copyright_filtering: bool = False # <-- SET TO FALSE
     enable_artist_filtering: bool = False # <-- SET TO FALSE
-    enable_score_filtering: bool = True
+    enable_score_filtering: bool = False
     enable_rating_filtering: bool = False
-    enable_dimension_filtering: bool = True 
+    enable_dimension_filtering: bool = False 
     per_image_json: bool = True
 
     # ---- Filtering Criteria (with placeholders) ---------------------------
     # General tags (e.g., appearance, actions, or objects)
     # "absurdly" will latch onto an exact string match.
     # Use "absurdly*" for prefix matching.
-    include_tags: List[str] = field(default_factory=lambda: ["*shemale*", "*cow*" "*futa*", "*futanari*", "*slime*", "*pokemon*", "*dickgirl*", "*pokephilia*", "*gardevoir*", "*monster_girl*", "*monster_boy*", 
-                                                            "thick_thighs", "*chastity_cage*", "*shortstack*", "*milking*", "insects", "horsecock", "*knot*", "ovipositor", "pregnant", "cat_ears", "catgirl", 
-                                                            "hair_over_one_eye", "*cat*", "*thighs*", "*eyes*", "*anus*", "knotted_penis", "stomach bulge", "bottomless", "dildo", "huge_breasts", "presenting",
-                                                              "*choker*", "electroworld", "*hair*", "*blush*", "catboy", "femboy_only", "monster_cock", "big_balls", "big_tit", "cumshot", "*cum*", "*pupils*",
-                                                                "*precum*", "*anal*", "*jewelry*", "looking_at_viewer", "bed_sheet", "medium_breasts", "*sex*", "*clothing*", "top-down bottom-up", "orc", "*skin*", "*horns*", "*ears*", "*breasts*",
-                                                                "goblin", "*anus*", "*bikini*", "feminine", "feminine", "*muscular*", "*breast*", "*eyelashes*", "*hair*", "*wet*", "*rabbit*", "*topless*", "*body*", "topless", "*body*", "*from*", "nipples", "*balls*", "*smile*"
+    include_tags: List[str] = field(default_factory=lambda: ["*cow*"
                                                                   ]) # <--
     exclude_tags: List[str] = field(default_factory=lambda: [  
         # --- Image Quality & Artifacts ---
@@ -115,7 +110,7 @@ class Config:
         # --- AI ---
         "ai generated", "ai art", "ai generated art", "ai generated image", "ai_generated", "ai_art",  "ai_artwork", "ai_image", "ai_artwork", "ai artifact", "ai*",
         # --- General Undesirables ---
-        "ugly", "grotesque", "loli*", "loli", "loli*", "loli art", "loli artwork", "loli image", "loli_art", "loli_artwork", "loli_image", "choose_your_own_adventure"
+        
     ])
 
     # Character tags (add or remove character names)

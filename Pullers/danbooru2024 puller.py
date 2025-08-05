@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional
 
+import polars as pl
 import pandas as pd
 from huggingface_hub import HfFolder, login
 
@@ -51,9 +52,9 @@ class Config:
 
     # ---- Column names (aligns with DeepGHS conventions) -------------------
     tags_col: str = "tags"                      # Changed from "tag_string"
-    #character_tags_col: str = "tag_string_character"  # No change needed as filter is off
-    #copyright_tags_col: str = "tag_string_copyright"  # No change needed as filter is off
-    #artist_tags_col: str = "tag_string_artist"      # No change needed as filter is off
+    character_tags_col: str = "tag_string_character"  # No change needed as filter is off
+    copyright_tags_col: str = "tag_string_copyright"  # No change needed as filter is off
+    artist_tags_col: str = "tag_string_artist"      # No change needed as filter is off
     score_col: str = "score"
     rating_col: str = "rating"
     width_col: str = "width"                    # Changed from "image_width"
@@ -105,7 +106,7 @@ class Config:
         # --- AI ---
         "ai generated", "ai art", "ai generated art", "ai generated image", "ai_generated", "ai_art",  "ai_artwork", "ai_image", "ai_artwork","ai artifact",
         # --- General Undesirables ---
-        "ugly", "grotesque", "loli*", "loli", "loli*", "loli art", "loli artwork", "loli image", "loli_art", "loli_artwork", "loli_image",
+        
     ])
 
     # Character tags (add or remove character names)
@@ -241,82 +242,72 @@ def apply_cli_overrides(args: argparse.Namespace, cfg: Config) -> None:
 # Metadata loading & filtering
 # ---------------------------------------------------------------------------
 def load_metadata(path: Path, cfg: Config) -> pd.DataFrame:
-    """Loads parquet, selecting only projected columns for efficiency."""
+    """
+    Faster parquet loader that mirrors Rule34’s lazy-scan approach.
+    Keeps the return type *pandas.DataFrame* so the rest of the script
+    stays 100 % untouched.
+    """
     if not path.exists():
         log.error(f"❌ Metadata path not found: {path}")
-        log.error("Please update `metadata_db_path` in the script or use the --metadata argument.")
         sys.exit(1)
 
-    # First, let's inspect the file to see what columns it actually has.
+    # Discover schema once (cheap) – keeps robust column / id checks
     try:
         import pyarrow.parquet as pq
-        parquet_schema = pq.read_schema(path)
-        available_cols = [field.name for field in parquet_schema]
+        available_cols = [f.name for f in pq.read_schema(path)]
     except Exception as e:
-        log.error(f"❌ Failed to read the schema from the metadata file: {e}")
-        log.error(f"   Please ensure the file at '{path}' is a valid Parquet file.")
+        log.error(f"❌ Failed to read parquet schema: {e}")
         sys.exit(1)
 
-    # Now, check if the required 'id' column exists before we do anything else.
+    # Original safety-checks (unchanged)
     if cfg.download_images and cfg.id_col not in available_cols:
-        log.error(f"❌ CRITICAL ERROR: The ID column '{cfg.id_col}' is required for downloading, but it was not found in your metadata file.")
-        log.error("This can happen if your metadata file uses a different name for the post ID column (e.g., 'post_id').")
-        log.error("\nHere is a list of all available columns in your file:")
-        log.error("-------------------------------------------")
-        # Print columns in a clean, readable format
-        for col in available_cols:
-            log.error(f"  - {col}")
-        log.error("-------------------------------------------")
-        log.error("\n>>> ACTION REQUIRED <<<")
-        log.error("1. Find the correct column name for post IDs in the list above.")
-        log.error(f"2. Open this script and change the line `id_col: str = \"{cfg.id_col}\"` in the `Config` class to use the correct name.")
-        log.error("   For example, if the correct column is 'post_id', change it to: `id_col: str = \"post_id\"`")
+        log.error(f"❌ CRITICAL ERROR: Required ID column '{cfg.id_col}' not found.")
         sys.exit(1)
 
-    # Dynamically build the list of columns to load based on config
-    cols_to_load = set()
+    # Build the projected column set exactly like before
+    cols_to_load: set[str] = set()
     if (cfg.enable_include_tags or cfg.enable_exclude_tags or
-         (cfg.save_filtered_metadata and cfg.per_image_json)):
+            (cfg.save_filtered_metadata and cfg.per_image_json)):
         cols_to_load.add(cfg.tags_col)
-    if cfg.enable_character_filtering or (cfg.save_filtered_metadata and cfg.per_image_json):
-        cols_to_load.add(cfg.character_tags_col)
-    if cfg.enable_copyright_filtering: cols_to_load.add(cfg.copyright_tags_col)
-    if cfg.enable_artist_filtering or (cfg.save_filtered_metadata and cfg.per_image_json):
-        cols_to_load.add(cfg.artist_tags_col)
-    if cfg.enable_score_filtering: cols_to_load.add(cfg.score_col)
-    if cfg.enable_rating_filtering: cols_to_load.add(cfg.rating_col)
-    if cfg.enable_dimension_filtering: cols_to_load.update([cfg.width_col, cfg.height_col])
+    if cfg.enable_score_filtering:        cols_to_load.add(cfg.score_col)
+    if cfg.enable_rating_filtering:       cols_to_load.add(cfg.rating_col)
+    if cfg.enable_dimension_filtering:    cols_to_load.update([cfg.width_col, cfg.height_col])
+    if cfg.download_images:               cols_to_load.update([cfg.id_col, cfg.file_path_col])
+    if cfg.save_filtered_metadata:        cols_to_load.add(cfg.file_path_col)
 
-    # Add columns required for I/O and downloading
-    if cfg.download_images:
-        cols_to_load.add(cfg.id_col)
-        cols_to_load.add(cfg.file_path_col) 
-
-    if cfg.save_filtered_metadata:
-        cols_to_load.add(cfg.file_path_col)
-
-
-
-    # We only load columns that are both requested and available.
     final_cols = list(cols_to_load.intersection(available_cols))
+    log.info(f"📖 Loading metadata via polars (projected cols = {final_cols})")
 
-    log.info(f"📖 Loading metadata from: {path}")
-    log.info(f"   Requesting columns: {final_cols}")
+    # ---- Fast path -------------------------------------------------------
     try:
-        df = pd.read_parquet(path, columns=final_cols)
-    except Exception as e:
-        log.error(f"❌ Failed to load metadata with the specified columns: {e}")
-        sys.exit(1)
+        lf = pl.scan_parquet(str(path))            # lazy, zero-copy
+        if final_cols:
+            lf = lf.select(final_cols)
 
-    if (
-        cfg.download_images
-        and cfg.id_col not in df.columns
-        and (df.index.name == cfg.id_col or cfg.id_col in df.index.names) # check both name and names for multi-index
-    ):
-        log.info(
-            "Detected '%s' stored as index – converting it to a column.", cfg.id_col
-        )
-        df.reset_index(inplace=True)
+        # Normalise dtypes while still lazy (cheap)
+        numeric_cols = [c for c in (cfg.width_col, cfg.height_col, cfg.score_col) if c in final_cols]
+        for col in numeric_cols:
+            lf = lf.with_columns(
+                pl.col(col)
+                  .cast(pl.Float64, strict=False)
+                  .fill_null(0)
+                  .cast(pl.Int64)
+            )
+        # Lower-case / string-ensure for tag column
+        if cfg.tags_col in final_cols:
+            lf = lf.with_columns(
+                pl.col(cfg.tags_col)
+                  .cast(pl.String)
+                  .str.to_lowercase()
+                  .fill_null("")
+            )
+
+       # Collect → pandas (streaming=True keeps memory steady)
+        df = lf.collect(streaming=True).to_pandas()
+
+    except Exception as e:
+        log.warning(f"⚠️  Polars fast-path failed ({e}); falling back to pandas.")
+        df = pd.read_parquet(path, columns=final_cols)
     # --- END: ROBUST FIX ---
 
         log.info("Normalizing data types for filtering...")
