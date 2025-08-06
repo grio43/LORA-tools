@@ -837,6 +837,35 @@ def process_downloads(metadata_stream: Iterator[Dict[str, Any]], cfg: Config, de
     all_existing = progress_tracker.completed_ids
     
     try:
+        # ---- Begin thread‑safe cache monkey‑patch -----------------
+        import threading
+        import cachetools
+        from hfutils.index import fetch as hf_fetch
+
+        class _ThreadSafeLRU(cachetools.LRUCache):
+            """LRUCache protected by an internal lock."""
+            def __init__(self, maxsize, *a, **kw):
+                super().__init__(maxsize, *a, **kw)
+                self._lock = threading.RLock()
+
+            # protect every mutating operation
+            def __getitem__(self, key):
+                with self._lock:
+                    return super().__getitem__(key)
+
+            def __setitem__(self, key, value):
+                with self._lock:
+                    super().__setitem__(key, value)
+
+            def popitem(self):
+                with self._lock:
+                    return super().popitem()
+
+        # replace the original global cache
+        hf_fetch._HF_TAR_IDX_PFILES_CACHE = _ThreadSafeLRU(
+            hf_fetch._HF_TAR_IDX_PFILES_CACHE.maxsize
+        )
+        # ---- End thread‑safe cache monkey‑patch -------------------
         with ThreadPoolExecutor(max_workers=cfg.workers) as executor:
             futures = []
             max_outstanding = cfg.workers * cfg.max_outstanding_multiplier  # Bounded queue
