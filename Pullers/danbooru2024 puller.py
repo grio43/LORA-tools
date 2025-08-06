@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-A script to filter the Danbooru dataset based on metadata criteria
-and optionally download the matching images using the cheesechaser library.
+Optimized Danbooru dataset filter and downloader with performance improvements.
+Includes directory sharding, batched writing, progress tracking, and graceful shutdown.
 """
 
 from __future__ import annotations
@@ -12,718 +12,710 @@ import os
 import re
 import json
 import sys
+import signal
 import textwrap
+import time
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Dict, Set, Any
+from collections import deque
+from contextlib import contextmanager
+import tempfile
+import shutil
 
 import polars as pl
 import pandas as pd
 from huggingface_hub import HfFolder, login
 
 try:
-    # Requires cheesechaser >= 0.5.0
     from cheesechaser.datapool import DanbooruNewestDataPool as DataPool
-except ModuleNotFoundError:  # graceful degradation
+except ModuleNotFoundError:
     DataPool = None
+
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
 logging.basicConfig(format="%(levelname)s: %(message)s", level=logging.INFO)
-log = logging.getLogger("cheesechaser_search")
+log = logging.getLogger("danbooru_puller")
+
+# ---------------------------------------------------------------------------
+# Performance Components
+# ---------------------------------------------------------------------------
+
+class DirectorySharding:
+    """Implements directory sharding for O(1) file lookups."""
+    
+    def __init__(self, base_dir: Path, files_per_shard: int = 5000):
+        self.base_dir = base_dir
+        self.files_per_shard = files_per_shard
+        self.base_dir.mkdir(parents=True, exist_ok=True)
+    
+    def get_shard_path(self, file_id: int) -> Path:
+        """Get the shard directory for a given file ID."""
+        shard_num = file_id // self.files_per_shard
+        shard_dir = self.base_dir / f"shard_{shard_num:06d}"
+        shard_dir.mkdir(parents=True, exist_ok=True)
+        return shard_dir
+    
+    def get_file_path(self, file_id: int, extension: str = ".jpg") -> Path:
+        """Get the full path for a file with sharding."""
+        shard_dir = self.get_shard_path(file_id)
+        return shard_dir / f"{file_id}{extension}"
+    
+    def file_exists(self, file_id: int, extensions: List[str] = [".jpg", ".png", ".gif", ".json"]) -> bool:
+        """Check if a file exists with any of the given extensions."""
+        shard_dir = self.get_shard_path(file_id)
+        return any((shard_dir / f"{file_id}{ext}").exists() for ext in extensions)
+    
+    def get_existing_ids(self) -> Set[int]:
+        """Get all existing file IDs across all shards."""
+        existing_ids = set()
+        for shard_dir in self.base_dir.glob("shard_*"):
+            if shard_dir.is_dir():
+                for file_path in shard_dir.iterdir():
+                    if file_path.stem.isdigit():
+                        existing_ids.add(int(file_path.stem))
+        return existing_ids
+
+
+class BatchedJSONWriter:
+    """Thread-safe batched JSON writer with atomic operations."""
+    
+    def __init__(self, sharding: DirectorySharding, batch_size: int = 100, 
+                 flush_interval: float = 5.0):
+        self.sharding = sharding
+        self.batch_size = batch_size
+        self.flush_interval = flush_interval
+        self.buffer = deque()
+        self.lock = threading.Lock()
+        self.last_flush = time.time()
+        self.stopped = False
+        self.flush_thread = threading.Thread(target=self._periodic_flush, daemon=True)
+        self.flush_thread.start()
+    
+    def _periodic_flush(self):
+        """Background thread to periodically flush the buffer."""
+        while not self.stopped:
+            time.sleep(self.flush_interval)
+            self.flush()
+    
+    def write(self, file_id: int, data: Dict[str, Any]):
+        """Add a JSON record to the write buffer."""
+        with self.lock:
+            self.buffer.append((file_id, data))
+            if len(self.buffer) >= self.batch_size:
+                self._flush_locked()
+    
+    def _flush_locked(self):
+        """Flush buffer to disk (must be called with lock held)."""
+        if not self.buffer:
+            return
+        
+        batch = list(self.buffer)
+        self.buffer.clear()
+        
+        # Write each file atomically
+        for file_id, data in batch:
+            json_path = self.sharding.get_file_path(file_id, ".json")
+            temp_path = json_path.with_suffix(".tmp")
+            
+            try:
+                with open(temp_path, "w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+                # Atomic rename
+                temp_path.replace(json_path)
+            except Exception as e:
+                log.error(f"Failed to write JSON for ID {file_id}: {e}")
+                if temp_path.exists():
+                    temp_path.unlink()
+    
+    def flush(self):
+        """Flush any pending writes."""
+        with self.lock:
+            self._flush_locked()
+    
+    def close(self):
+        """Close the writer and flush remaining data."""
+        self.stopped = True
+        self.flush()
+
+
+class ProgressTracker:
+    """Tracks download progress and enables efficient resumption."""
+    
+    def __init__(self, total_items: int, update_interval: int = 100):
+        self.total_items = total_items
+        self.update_interval = update_interval
+        self.processed_items = 0
+        self.failed_items = 0
+        self.skipped_items = 0
+        self.start_time = time.time()
+        self.lock = threading.Lock()
+        self.last_update = 0
+    
+    def update(self, processed: int = 0, failed: int = 0, skipped: int = 0):
+        """Update progress counters."""
+        with self.lock:
+            self.processed_items += processed
+            self.failed_items += failed
+            self.skipped_items += skipped
+            
+            total_done = self.processed_items + self.failed_items + self.skipped_items
+            if total_done - self.last_update >= self.update_interval:
+                self._print_progress()
+                self.last_update = total_done
+    
+    def _print_progress(self):
+        """Print progress information."""
+        elapsed = time.time() - self.start_time
+        total_done = self.processed_items + self.failed_items + self.skipped_items
+        rate = total_done / elapsed if elapsed > 0 else 0
+        remaining = self.total_items - total_done
+        eta = remaining / rate if rate > 0 else 0
+        
+        log.info(f"Progress: {total_done}/{self.total_items} "
+                f"({100*total_done/self.total_items:.1f}%) | "
+                f"Rate: {rate:.1f}/s | ETA: {eta:.0f}s | "
+                f"✓{self.processed_items} ✗{self.failed_items} ⊘{self.skipped_items}")
+    
+    def finish(self):
+        """Print final statistics."""
+        elapsed = time.time() - self.start_time
+        total_done = self.processed_items + self.failed_items + self.skipped_items
+        log.info(f"🎉 Completed {total_done} items in {elapsed:.1f}s")
+        log.info(f"   Processed: {self.processed_items}")
+        log.info(f"   Failed: {self.failed_items}")
+        log.info(f"   Skipped: {self.skipped_items}")
+
+
+class SoftStopHandler:
+    """Two-stage graceful shutdown handler for Ctrl+C."""
+    
+    def __init__(self):
+        self.stop_requested = False
+        self.force_stop = False
+        signal.signal(signal.SIGINT, self._handle_signal)
+        signal.signal(signal.SIGTERM, self._handle_signal)
+    
+    def _handle_signal(self, signum, frame):
+        """Handle interrupt signals."""
+        if not self.stop_requested:
+            self.stop_requested = True
+            log.warning("\n⚠️  Graceful shutdown initiated. Press Ctrl+C again to force stop.")
+        else:
+            self.force_stop = True
+            log.error("\n❌ Force stop requested. Exiting immediately.")
+            sys.exit(1)
+    
+    def should_stop(self) -> bool:
+        """Check if stop has been requested."""
+        return self.stop_requested
+
 
 # ---------------------------------------------------------------------------
 # Configuration
-#
-# Easiest way to use: Edit the default values directly in this class.
-# Any value set here can be overridden by a command-line argument.
 # ---------------------------------------------------------------------------
 @dataclass
 class Config:
-    """Holds all runtime parameters (may be overridden from CLI)."""
-
-    # ---- Paths ------------------------------------------------------------
+    """Configuration with performance optimizations."""
+    
+    # Paths
     metadata_db_path: str = r"/media/andrewk/qnap-public/New file/Danbooru2004/metadata.parquet"
     output_dir: str = r"/mnt/raid0/DAb/"
-
-    # ---- Hugging Face -----------------------------------------------------
+    
+    # Hugging Face
     dataset_repo: str = "deepghs/danbooru2024"
-    hf_auth_token: Optional[str] = os.getenv("Add token", None)  # Set your token here or use env var
-
-    # ---- Column names (aligns with DeepGHS conventions) -------------------
-    tags_col: str = "tags"                      # Changed from "tag_string"
-    character_tags_col: str = "tag_string_character"  # No change needed as filter is off
-    copyright_tags_col: str = "tag_string_copyright"  # No change needed as filter is off
-    artist_tags_col: str = "tag_string_artist"      # No change needed as filter is off
+    hf_auth_token: Optional[str] = os.getenv("HF_TOKEN", None)
+    
+    # Column names
+    tags_col: str = "tags"
+    character_tags_col: str = "tag_string_character"
+    copyright_tags_col: str = "tag_string_copyright"
+    artist_tags_col: str = "tag_string_artist"
     score_col: str = "score"
     rating_col: str = "rating"
-    width_col: str = "width"                    # Changed from "image_width"
-    height_col: str = "height"                  # Changed from "image_height"
+    width_col: str = "width"
+    height_col: str = "height"
     file_path_col: str = "file_url"
     id_col: str = "id"
-
-    # ---- Filtering Toggles (Set to False to disable a filter group) ------
+    
+    # Filtering toggles
     enable_include_tags: bool = False
     enable_exclude_tags: bool = False
-    enable_character_filtering: bool = False # <-- SET TO FALSE
-    enable_copyright_filtering: bool = False # <-- SET TO FALSE
-    enable_artist_filtering: bool = False # <-- SET TO FALSE
+    enable_character_filtering: bool = False
+    enable_copyright_filtering: bool = False
+    enable_artist_filtering: bool = False
     enable_score_filtering: bool = False
     enable_rating_filtering: bool = False
     enable_dimension_filtering: bool = False
     per_image_json: bool = True
-
-    # ---- Filtering Criteria (with placeholders) ---------------------------
-    # General tags (e.g., appearance, actions, or objects)
-    # "absurdly" will latch onto an exact string match.
-    # Use "absurdly*" for prefix matching.
-    include_tags: List[str] = field(default_factory=lambda: ["*eye"]) # <--
-    exclude_tags: List[str] = field(default_factory=lambda: [  
-        # --- Image Quality & Artifacts ---
+    
+    # Filtering criteria
+    include_tags: List[str] = field(default_factory=lambda: ["*eye"])
+    exclude_tags: List[str] = field(default_factory=lambda: [
         "lowres", "blurry", "pixelated", "jpeg artifacts", "compression artifacts",
         "low quality", "worst quality", "bad quality",
         "watermark", "signature", "artist name", "logo", "stamp",
         "text", "english_text", "speech bubble",
-
-        # --- Anatomy & Proportions ---
         "bad anatomy", "bad hands", "bad proportions", "malformed limbs",
         "mutated hands", "extra limbs", "extra fingers", "fused fingers",
         "long neck", "deformed", "disfigured", "mutation", "poorly drawn face",
-
-        # --- Unwanted Art Styles ---
-        "3d", "cgi", "render", "vray",
-        "comic",
-        # --- People ---
+        "3d", "cgi", "render", "vray", "comic",
         "2girls", "3girls", "2boys", "3boys",
-
-        # --- Composition & Framing ---
         "grid", "collage", "multi-panel", "multiple views", "split screen",
         "border", "frame", "out of frame", "cropped",
-
-        # --- Color & Tone ---
         "monochrome", "grayscale",
-
-        # --- AI ---
-        "ai generated", "ai art", "ai generated art", "ai generated image", "ai_generated", "ai_art",  "ai_artwork", "ai_image", "ai_artwork","ai artifact",
-        # --- General Undesirables ---
-        
+        "ai generated", "ai art", "ai_generated", "ai_artwork", "ai artifact",
     ])
-
-    # Character tags (add or remove character names)
+    
     include_characters: List[str] = field(default_factory=lambda: ["hakurei_reimu", "kirisame_marisa"])
     exclude_characters: List[str] = field(default_factory=lambda: ["some_character_to_exclude"])
-
-    # Copyright/Series tags (add or remove series, game, or anime titles)
     include_copyrights: List[str] = field(default_factory=lambda: ["touhou", "genshin_impact"])
     exclude_copyrights: List[str] = field(default_factory=lambda: ["some_series_to_exclude"])
-
-    # Artist tags (add or remove specific artist names)
     include_artists: List[str] = field(default_factory=lambda: ["cutesexyrobutts*"])
     exclude_artists: List[str] = field(default_factory=lambda: ["bob"])
-
-    # Other filters
-    min_score: Optional[int] = 30 # <--
+    
+    min_score: Optional[int] = 30
     ratings: List[str] = field(default_factory=lambda: ["safe", "general"])
-    square_only: bool = False # <--
-    min_square_size: int = 1024 # <--
-    min_width: int = 1024 # <--
-    min_height: int = 1024 # <--
-    max_width: int = 90000 # <--
-    max_height: int = 90000 # <--
+    square_only: bool = False
+    min_square_size: int = 1024
+    min_width: int = 1024
+    min_height: int = 1024
+    max_width: int = 90000
+    max_height: int = 90000
+    
+    # Behavior flags
+    download_images: bool = True
+    save_filtered_metadata: bool = True
+    filtered_metadata_format: str = "json"
+    strip_json_details: bool = True
+    exclude_gifs: bool = True
+    dry_run: bool = False
+    
+    # Performance settings
+    workers: int = 15
+    files_per_shard: int = 5000
+    json_batch_size: int = 100
+    json_flush_interval: float = 5.0
+    progress_update_interval: int = 100
+    batch_size: int = 1000
+    max_outstanding_multiplier: int = 10
 
-    # ---- Behaviour flags --------------------------------------------------
-    download_images: bool = True # <--
-    save_filtered_metadata: bool = True # <--
-    filtered_metadata_format: str = "json"  # json | txt # <--
-    strip_json_details: bool = True # <--
-    exclude_gifs: bool = True # <--
-    dry_run: bool = False # <--
 
-    # ---- Performance ------------------------------------------------------
-    workers: int = 15 # <--
-            
+# ---------------------------------------------------------------------------
+# Metadata loading with streaming
+# ---------------------------------------------------------------------------
+def load_and_filter_metadata(cfg: Config) -> pl.LazyFrame:
+    """Load metadata using Polars lazy evaluation for memory efficiency."""
+    path = Path(cfg.metadata_db_path)
+    
+    if not path.exists():
+        log.error(f"❌ Metadata path not found: {path}")
+        sys.exit(1)
+    
+    log.info(f"📖 Loading metadata with Polars lazy evaluation...")
+    
+    # Start with lazy frame
+    lf = pl.scan_parquet(str(path))
+    
+    # Build filter expressions
+    filters = []
+    
+    # File type filtering
+    if cfg.exclude_gifs:
+        filters.append(~pl.col(cfg.file_path_col).str.ends_with(".gif"))
+    
+    excluded_extensions = ('.zip', '.mp4', '.webm', '.swf')
+    for ext in excluded_extensions:
+        filters.append(~pl.col(cfg.file_path_col).str.ends_with(ext))
+    
+    # Tag filtering with Polars expressions
+    if cfg.enable_include_tags and cfg.include_tags:
+        for tag in cfg.include_tags:
+            pattern = build_tag_pattern(tag)
+            filters.append(pl.col(cfg.tags_col).str.contains(pattern))
+    
+    if cfg.enable_exclude_tags and cfg.exclude_tags:
+        patterns = [build_tag_pattern(tag) for tag in cfg.exclude_tags]
+        combined_pattern = "|".join(patterns)
+        filters.append(~pl.col(cfg.tags_col).str.contains(combined_pattern))
+    
+    # Score filtering
+    if cfg.enable_score_filtering and cfg.min_score is not None:
+        filters.append(pl.col(cfg.score_col) >= cfg.min_score)
+    
+    # Rating filtering
+    if cfg.enable_rating_filtering and cfg.ratings:
+        filters.append(pl.col(cfg.rating_col).is_in(cfg.ratings))
+    
+    # Dimension filtering
+    if cfg.enable_dimension_filtering:
+        if cfg.square_only:
+            filters.append(pl.col(cfg.width_col) == pl.col(cfg.height_col))
+            filters.append(pl.col(cfg.width_col) >= cfg.min_square_size)
+        else:
+            if cfg.min_width > 0:
+                filters.append(pl.col(cfg.width_col) >= cfg.min_width)
+            if cfg.min_height > 0:
+                filters.append(pl.col(cfg.height_col) >= cfg.min_height)
+            if cfg.max_width > 0:
+                filters.append(pl.col(cfg.width_col) <= cfg.max_width)
+            if cfg.max_height > 0:
+                filters.append(pl.col(cfg.height_col) <= cfg.max_height)
+    
+    # Apply all filters
+    if filters:
+        combined_filter = filters[0]
+        for f in filters[1:]:
+            combined_filter = combined_filter & f
+        lf = lf.filter(combined_filter)
+    
+    return lf
+
+
+def build_tag_pattern(tag: str) -> str:
+    """Build regex pattern for tag matching."""
+    starts_with_star = tag.startswith('*')
+    ends_with_star = tag.endswith('*')
+    clean_tag = tag.strip('*')
+    escaped_tag = re.escape(clean_tag)
+    
+    if starts_with_star and ends_with_star:
+        return escaped_tag
+    elif ends_with_star:
+        return r"\b" + escaped_tag
+    elif starts_with_star:
+        return escaped_tag + r"\b"
+    else:
+        return r"\b" + escaped_tag + r"\b"
+
+
+def stream_filtered_metadata(lf: pl.LazyFrame, cfg: Config, batch_size: int = 1000):
+    """Stream filtered metadata in batches for memory efficiency."""
+    # Convert to streaming iterator
+    df_iter = lf.collect(streaming=True).iter_slices(batch_size)
+    
+    for batch_df in df_iter:
+        # Convert Polars DataFrame to pandas for compatibility
+        yield batch_df.to_pandas()
+
+
+def normalize_rating(rating: str) -> Optional[str]:
+    """Normalize rating values according to the mapping."""
+    rating_map = {'g': 'safe', 's': None, 'q': 'questionable', 'e': 'explicit'}
+    return rating_map.get(rating, rating)
+
+
+def process_metadata_record(row: pd.Series, cfg: Config) -> Dict[str, Any]:
+    """Process a single metadata record with all transformations."""
+    record = row.dropna().to_dict()
+    
+    # Remove file path column
+    if cfg.file_path_col in record:
+        del record[cfg.file_path_col]
+    
+    # Strip details if requested
+    if cfg.strip_json_details:
+        for key in [cfg.score_col, cfg.width_col, cfg.height_col]:
+            if key in record:
+                del record[key]
+    
+    # Rating transformation
+    if 'rating' in record:
+        normalized = normalize_rating(record['rating'])
+        if normalized is None:
+            del record['rating']
+        else:
+            record['rating'] = normalized
+    
+    # Merge tag fields
+    tag_source_fields = [
+        'tag_string_general',
+        'tag_string_character',
+        'tag_string_copyright',
+        'tag_string_artist',
+        'tag_string_meta'
+    ]
+    
+    tag_parts = []
+    for field in tag_source_fields:
+        if field in record:
+            value = str(record.get(field, '')).strip()
+            if value:
+                tag_parts.append(value)
+    
+    if tag_parts:
+        merged_tags = ' '.join(tag_parts).lower()
+        merged_tags = ' '.join(merged_tags.split())
+        
+        # Remove duplicates while preserving order
+        seen = set()
+        unique_tags = []
+        for tag in merged_tags.split():
+            if tag not in seen:
+                seen.add(tag)
+                unique_tags.append(tag)
+        
+        record['tags'] = ' '.join(unique_tags)
+    
+    # Clean up original tag columns
+    for field in tag_source_fields:
+        if field in record:
+            del record[field]
+    
+    return record
+
+
+# ---------------------------------------------------------------------------
+# Download with optimizations
+# ---------------------------------------------------------------------------
+def download_with_optimizations(df: pd.DataFrame, cfg: Config, sharding: DirectorySharding,
+                               json_writer: BatchedJSONWriter, stop_handler: SoftStopHandler):
+    """Download images with all optimizations enabled."""
+    if DataPool is None:
+        log.error("CheeseChaser is not installed. Install with 'pip install cheesechaser'.")
+        return
+    
+    # Setup progress tracking
+    progress = ProgressTracker(len(df), cfg.progress_update_interval)
+    
+    # Filter out existing files
+    existing_ids = sharding.get_existing_ids()
+    df_to_download = df[~df[cfg.id_col].isin(existing_ids)]
+    
+    if len(df_to_download) == 0:
+        log.info("All files already exist. Nothing to download.")
+        return
+    
+    log.info(f"Starting optimized download of {len(df_to_download)} images...")
+    
+    # Process in batches for better memory usage
+    batch_size = cfg.batch_size
+    pool = DataPool()
+    
+    for i in range(0, len(df_to_download), batch_size):
+        if stop_handler.should_stop():
+            log.warning("Stopping download due to user request...")
+            break
+        
+        batch = df_to_download.iloc[i:i+batch_size]
+        ids = batch[cfg.id_col].tolist()
+        
+        # Download batch
+        try:
+            # Create temporary directory for batch
+            with tempfile.TemporaryDirectory() as temp_dir:
+                temp_path = Path(temp_dir)
+                
+                # Download to temp directory first
+                pool.batch_download_to_directory(
+                    resource_ids=ids,
+                    dst_dir=temp_path,
+                    max_workers=cfg.workers
+                )
+                
+                # Move files to sharded directories and write JSON
+                for file_id in ids:
+                    # Find downloaded file
+                    downloaded_files = list(temp_path.glob(f"{file_id}.*"))
+                    
+                    if downloaded_files:
+                        src_file = downloaded_files[0]
+                        dst_file = sharding.get_file_path(file_id, src_file.suffix)
+                        
+                        # Atomic move
+                        shutil.move(str(src_file), str(dst_file))
+                        
+                        # Write JSON metadata only after successful download
+                        if cfg.save_filtered_metadata and cfg.per_image_json:
+                            row = batch[batch[cfg.id_col] == file_id].iloc[0]
+                            metadata = process_metadata_record(row, cfg)
+                            json_writer.write(file_id, metadata)
+                        
+                        progress.update(processed=1)
+                    else:
+                        progress.update(failed=1)
+                
+        except Exception as e:
+            log.error(f"Batch download failed: {e}")
+            progress.update(failed=len(ids))
+    
+    # Cleanup
+    json_writer.close()
+    progress.finish()
 
 
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 def _parse_tag_list(value: str) -> List[str]:
-    """Parses comma- or space-separated tag strings into a list."""
+    """Parse comma- or space-separated tag strings into a list."""
     return [t for t in re.split(r"[\s,]+", value.strip()) if t]
 
+
 def build_cli() -> argparse.ArgumentParser:
-    """Defines and configures the command-line argument parser."""
+    """Define command-line argument parser."""
     p = argparse.ArgumentParser(
-        prog="cheesechaser-search",
-        description="Filter Danbooru metadata & optionally download matching images.",
+        prog="danbooru-puller-optimized",
+        description="Optimized Danbooru metadata filter & image downloader.",
         formatter_class=argparse.RawTextHelpFormatter,
-        epilog=textwrap.dedent("""
-            Example Usage:
-            --------------
-            # Download high-scoring images of '1girl' to a specific folder
-            python search.py --metadata /data/danbooru.parquet --include "1girl solo" --min-score 100 --output ./My_Filtered_Images
-
-            # Filter for square images that are at least 1024x1024, excluding certain tags
-            python search.py --square --min-square-size 1024 --exclude "multiple_girls nsfw"
-
-            # Perform a dry run to see match count without downloading or saving metadata
-            python search.py --include cat_ears --dry-run
-            """),
     )
-
-    # Paths / IO
-    p.add_argument("--metadata", type=str, help="Path to Danbooru parquet (default: %(default)s)")
-    p.add_argument("--output", type=str, help="Destination directory for downloads & outputs")
-
-    # Dataset / Auth
-    p.add_argument("--repo", type=str, help="Hugging Face dataset repo id (default: %(default)s)")
-    p.add_argument("--token", type=str, help="HF token string (overrides env / keyring)")
-
-    # Tag filtering
-    p.add_argument("--include", "-i", type=_parse_tag_list, help="Tags to include (comma or space separated)")
+    
+    # Paths
+    p.add_argument("--metadata", type=str, help="Path to Danbooru parquet")
+    p.add_argument("--output", type=str, help="Destination directory")
+    
+    # Auth
+    p.add_argument("--token", type=str, help="HF token")
+    
+    # Filters
+    p.add_argument("--include", "-i", type=_parse_tag_list, help="Tags to include")
     p.add_argument("--exclude", "-x", type=_parse_tag_list, help="Tags to exclude")
-
-    # Other filters
     p.add_argument("--min-score", type=int, help="Minimum score")
-    p.add_argument("--ratings", nargs="*", help="Allowed ratings e.g. safe questionable")
+    p.add_argument("--ratings", nargs="*", help="Allowed ratings")
     p.add_argument("--square", action="store_true", help="Require square images")
-    p.add_argument("--min-square-size", type=int, help="Min dimension for square images")
+    p.add_argument("--min-square-size", type=int, help="Min dimension for square")
     p.add_argument("--min-width", type=int)
     p.add_argument("--min-height", type=int)
     p.add_argument("--max-width", type=int)
     p.add_argument("--max-height", type=int)
-    p.add_argument("--per-image-json", action="store_true",
-               help="Write one JSON side-car per downloaded image")
-
-    # Behaviour flags
-    p.add_argument("--no-download", dest="download", action="store_false", help="Skip image downloads")
-    p.add_argument("--no-save-metadata", dest="save_meta", action="store_false", help="Do not save filtered metadata")
-    p.add_argument("--dry-run", action="store_true", help="Exit after printing stats (implies --no-download)")
-    p.add_argument("--exclude-gifs", action="store_true", help="Exclude .gif files from the download list")
-
-    # Perf
+    
+    # Behavior
+    p.add_argument("--no-download", dest="download", action="store_false")
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--batch-size", type=int, help="Batch size for processing")
+    
+    # Performance
     p.add_argument("--workers", type=int, help="Number of download workers")
-
+    p.add_argument("--files-per-shard", type=int, help="Files per shard directory")
+    
     return p
 
+
 def apply_cli_overrides(args: argparse.Namespace, cfg: Config) -> None:
-    """Mutates cfg in-place based on CLI arguments."""
+    """Apply CLI arguments to configuration."""
     if args.metadata: cfg.metadata_db_path = args.metadata
     if args.output: cfg.output_dir = args.output
-    if args.repo: cfg.dataset_repo = args.repo
     if args.token: cfg.hf_auth_token = args.token
-
-    if args.include is not None: cfg.include_tags = args.include
-    if args.exclude is not None: cfg.exclude_tags = args.exclude
-    if args.min_score is not None: cfg.min_score = args.min_score
-    if args.ratings is not None: cfg.ratings = args.ratings
-    if args.square: cfg.square_only = True
-    if args.min_square_size is not None: cfg.min_square_size = args.min_square_size
-    if args.min_width is not None: cfg.min_width = args.min_width
-    if args.min_height is not None: cfg.min_height = args.min_height
-    if args.max_width is not None: cfg.max_width = args.max_width
-    if args.max_height is not None: cfg.max_height = args.max_height
-
+    
+    # Auto-enable filters when arguments provided
+    if args.include is not None:
+        cfg.include_tags = args.include
+        cfg.enable_include_tags = True
+    if args.exclude is not None:
+        cfg.exclude_tags = args.exclude
+        cfg.enable_exclude_tags = True
+    
+    if args.min_score is not None:
+        cfg.min_score = args.min_score
+        cfg.enable_score_filtering = True
+    if args.ratings is not None:
+        cfg.ratings = args.ratings
+        cfg.enable_rating_filtering = True
+    
+    if args.square:
+        cfg.square_only = True
+        cfg.enable_dimension_filtering = True
+    if args.min_square_size is not None:
+        cfg.min_square_size = args.min_square_size
+    if args.min_width is not None:
+        cfg.min_width = args.min_width
+        cfg.enable_dimension_filtering = True
+    if args.min_height is not None:
+        cfg.min_height = args.min_height
+        cfg.enable_dimension_filtering = True
+    if args.max_width is not None:
+        cfg.max_width = args.max_width
+        cfg.enable_dimension_filtering = True
+    if args.max_height is not None:
+        cfg.max_height = args.max_height
+        cfg.enable_dimension_filtering = True
+    
     if args.workers is not None: cfg.workers = args.workers
-    # Final check: can't use `is not None` because action="store_false" makes `download` False
+    if args.batch_size is not None: cfg.batch_size = args.batch_size
+    if args.files_per_shard is not None: cfg.files_per_shard = args.files_per_shard
+    
     if hasattr(args, 'download') and not args.download:
         cfg.download_images = False
-    if hasattr(args, 'save_meta') and not args.save_meta:
-        cfg.save_filtered_metadata = False
-
+    
     if args.dry_run:
         cfg.dry_run = True
         cfg.download_images = False
 
-    if args.exclude_gifs: 
-        cfg.exclude_gifs = True 
-
-# ---------------------------------------------------------------------------
-# Metadata loading & filtering
-# ---------------------------------------------------------------------------
-def load_metadata(path: Path, cfg: Config) -> pd.DataFrame:
-    """
-    Faster parquet loader that mirrors Rule34’s lazy-scan approach.
-    Keeps the return type *pandas.DataFrame* so the rest of the script
-    stays 100 % untouched.
-    """
-    if not path.exists():
-        log.error(f"❌ Metadata path not found: {path}")
-        sys.exit(1)
-
-    # Discover schema once (cheap) – keeps robust column / id checks
-    try:
-        import pyarrow.parquet as pq
-        available_cols = [f.name for f in pq.read_schema(path)]
-    except Exception as e:
-        log.error(f"❌ Failed to read parquet schema: {e}")
-        sys.exit(1)
-
-    # Original safety-checks (unchanged)
-    if cfg.download_images and cfg.id_col not in available_cols:
-        log.error(f"❌ CRITICAL ERROR: Required ID column '{cfg.id_col}' not found.")
-        sys.exit(1)
-
-    # Build the projected column set exactly like before
-    cols_to_load: set[str] = set()
-    if (cfg.enable_include_tags or cfg.enable_exclude_tags or
-            (cfg.save_filtered_metadata and cfg.per_image_json)):
-        cols_to_load.add(cfg.tags_col)
-    if cfg.enable_score_filtering:        cols_to_load.add(cfg.score_col)
-    if cfg.enable_rating_filtering:       cols_to_load.add(cfg.rating_col)
-    if cfg.enable_dimension_filtering:    cols_to_load.update([cfg.width_col, cfg.height_col])
-    if cfg.download_images:               cols_to_load.update([cfg.id_col, cfg.file_path_col])
-    if cfg.save_filtered_metadata:        cols_to_load.add(cfg.file_path_col)
-
-    final_cols = list(cols_to_load.intersection(available_cols))
-    log.info(f"📖 Loading metadata via polars (projected cols = {final_cols})")
-
-    # ---- Fast path -------------------------------------------------------
-    try:
-        lf = pl.scan_parquet(str(path))            # lazy, zero-copy
-        if final_cols:
-            lf = lf.select(final_cols)
-
-        # Normalise dtypes while still lazy (cheap)
-        numeric_cols = [c for c in (cfg.width_col, cfg.height_col, cfg.score_col) if c in final_cols]
-        for col in numeric_cols:
-            lf = lf.with_columns(
-                pl.col(col)
-                  .cast(pl.Float64, strict=False)
-                  .fill_null(0)
-                  .cast(pl.Int64)
-            )
-        # Lower-case / string-ensure for tag column
-        if cfg.tags_col in final_cols:
-            lf = lf.with_columns(
-                pl.col(cfg.tags_col)
-                  .cast(pl.String)
-                  .str.to_lowercase()
-                  .fill_null("")
-            )
-
-       # Collect → pandas (streaming=True keeps memory steady)
-        df = lf.collect(streaming=True).to_pandas()
-
-    except Exception as e:
-        log.warning(f"⚠️  Polars fast-path failed ({e}); falling back to pandas.")
-        df = pd.read_parquet(path, columns=final_cols)
-    # --- END: ROBUST FIX ---
-
-        log.info("Normalizing data types for filtering...")
-
-    # Convert numeric columns, coercing errors to NaN
-    for col in (cfg.width_col, cfg.height_col, cfg.score_col):
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-
-    # Helper function to normalize tag-like columns
-    def _normalise(series: pd.Series) -> pd.Series:
-        return (
-            series
-            .apply(lambda x: " ".join(x) if isinstance(x, (list, tuple, set)) else x)
-            .astype(str)
-            .str.lower()
-            .fillna("")
-        )
-
-    # Normalize all tag columns
-    for col in (
-        cfg.tags_col,
-        cfg.character_tags_col, # <-- Keep these commented if the filters are off
-        cfg.copyright_tags_col,
-        cfg.artist_tags_col,
-    ):
-        if col in df.columns:
-            df[col] = _normalise(df[col])
-
-    return df
-
-def build_filter_mask(df: pd.DataFrame, cfg: Config) -> pd.Series:
-    """Return boolean mask for rows matching cfg filters."""
-    mask = pd.Series(True, index=df.index)
-    log.info
-
-    # --- File Type Filtering -----------------------------------------
-    if cfg.file_path_col in df.columns:
-        excluded_extensions = ('.zip', '.mp4', '.webm', '.swf')
-        log.info(f"    Excluding files with extensions: {', '.join(excluded_extensions)}")
-        mask &= ~df[cfg.file_path_col].str.lower().str.endswith(excluded_extensions, na=False)
-
-    if cfg.exclude_gifs and cfg.file_path_col in df.columns:
-        log.info("    Excluding .gif files from download list.")
-        mask &= ~df[cfg.file_path_col].str.lower().str.endswith('.gif', na=False)
-
-    # --- Tag-based Filtering -----------------------------------------
-# Helper function to avoid code repetition
-    def apply_tag_filters(series: pd.Series, include_list: List[str], exclude_list: List[str], log_name: str):
-        nonlocal mask
-
-        def _create_pattern(tag: str) -> str:
-            """Generates a regex pattern based on wildcard usage in the tag."""
-            starts_with_star = tag.startswith('*')
-            ends_with_star = tag.endswith('*')
-            clean_tag = tag.strip('*')
-            escaped_tag = re.escape(clean_tag)
-
-            # Case 1: Substring match (e.g., "*dog*")
-            if starts_with_star and ends_with_star:
-                return escaped_tag
-            
-            # Case 2: Prefix match (e.g., "dog*")
-            elif ends_with_star:
-                # Matches "dog_boy", "dogs", but not "good_dog"
-                return r"\b" + escaped_tag
-
-            # Case 3: Suffix match (e.g., "*dog")
-            elif starts_with_star:
-                # Matches "good_dog", but not "dogs" or "dog_boy"
-                return escaped_tag + r"\b"
-
-            # Case 4: Exact whole-word match (e.g., "dog")
-            else:
-                # This is the most efficient pattern for exact matches.
-                return r"\b" + escaped_tag + r"\b"
-
-        # Inclusion (AND logic): image must have ALL specified tags.
-        if include_list:
-            log.info(f"    Including {log_name} (ALL required): {include_list}")
-            for tag in include_list:
-                if not tag: continue # Skip empty strings
-                pattern = _create_pattern(tag)
-                mask &= series.str.contains(pattern, regex=True, na=False, flags=re.IGNORECASE)
-
-        # Exclusion (OR logic): image must not have ANY of these tags.
-        if exclude_list:
-            log.info(f"    Excluding {log_name} (ANY will be excluded): {exclude_list}")
-            
-            # Combine all non-empty exclusion patterns into a single regex with '|'.
-            # This is more efficient than applying .str.contains in a loop.
-            patterns = [_create_pattern(tag) for tag in exclude_list if tag]
-            
-            if patterns:
-                final_pattern = "|".join(patterns)
-                mask &= ~series.str.contains(final_pattern, regex=True, na=False, flags=re.IGNORECASE)
-
-    # General Tags
-    if cfg.enable_include_tags or cfg.enable_exclude_tags:
-        if cfg.tags_col in df.columns:
-            tag_series = df[cfg.tags_col].str.lower().fillna("")
-            
-            # Conditionally create the lists to pass to the helper function
-            include_list = cfg.include_tags if cfg.enable_include_tags else []
-            exclude_list = cfg.exclude_tags if cfg.enable_exclude_tags else []
-            
-            # Only call the function if there's actually something to do
-            if include_list or exclude_list:
-                apply_tag_filters(tag_series, include_list, exclude_list, "general tags")
-        else:
-            log.warning(f"'{cfg.tags_col}' not found. Skipping general tag filtering.")
-
-    # Copyright Tags
-    if cfg.enable_copyright_filtering:
-        if cfg.copyright_tags_col in df.columns:
-            copy_series = df[cfg.copyright_tags_col].str.lower().fillna("")
-            apply_tag_filters(copy_series, cfg.include_copyrights, cfg.exclude_copyrights, "copyrights")
-        else:
-            log.warning(f"'{cfg.copyright_tags_col}' not found. Skipping copyright filtering.")
-
-    # Artist Tags
-    if cfg.enable_artist_filtering:
-        if cfg.artist_tags_col in df.columns:
-            artist_series = df[cfg.artist_tags_col].str.lower().fillna("")
-            apply_tag_filters(artist_series, cfg.include_artists, cfg.exclude_artists, "artists")
-        else:
-            log.warning(f"'{cfg.artist_tags_col}' not found. Skipping artist filtering.")
-
-    # --- Metadata Filtering ------------------------------------------
-    # Score
-    if cfg.enable_score_filtering and cfg.min_score is not None:
-        log.info(f"    Filtering for score >= {cfg.min_score}")
-        mask &= df[cfg.score_col].fillna(0) >= cfg.min_score
-
-    # Ratings
-    if cfg.enable_rating_filtering and cfg.ratings:
-        log.info(f"    Filtering for ratings: {cfg.ratings}")
-        mask &= df[cfg.rating_col].fillna("").isin(cfg.ratings)
-
-    # Dimensions
-    if cfg.enable_dimension_filtering:
-        w, h = df[cfg.width_col], df[cfg.height_col]
-        if cfg.square_only:
-            log.info(f"    Filtering for square images >= {cfg.min_square_size}px.")
-            mask &= (w == h) & (w >= cfg.min_square_size)
-        else:
-            log.info(f"    Filtering for dimensions: {cfg.min_width}x{cfg.min_height} to {cfg.max_width}x{cfg.max_height}")
-            if cfg.min_width > 0: mask &= w >= cfg.min_width
-            if cfg.min_height > 0: mask &= h >= cfg.min_height
-            if cfg.max_width > 0: mask &= w <= cfg.max_width
-            if cfg.max_height > 0: mask &= h <= cfg.max_height
-            
-    return mask
-
-# ---------------------------------------------------------------------------
-# Output and Download Helpers
-# ---------------------------------------------------------------------------
-def save_filtered_metadata(df: pd.DataFrame, cfg: Config, dest_dir: Path) -> None:
-    """Save metadata either as one big file or as one JSON per image."""
-    keys_to_strip = [cfg.score_col, cfg.width_col, cfg.height_col]
-
-    try:
-        # ── Per-image side-cars ──────────────────────────────────────
-        if cfg.filtered_metadata_format == "json" and cfg.per_image_json:
-            for _, row in df.iterrows():
-                image_id = row[cfg.id_col]
-                path = dest_dir / f"{image_id}.json"
-
-                # Convert row to a dictionary, dropping any NaN values
-                record = row.dropna().to_dict()
-
-                # Remove the file path column as it's not needed in the side-car
-                if cfg.file_path_col in record:
-                    del record[cfg.file_path_col]
-
-                # If the strip flag is on, remove the specified keys
-                if cfg.strip_json_details:
-                    for key in keys_to_strip:
-                        if key in record:
-                            del record[key]
-
-                # --- APPLY JSON TRANSFORMATIONS PER INSTRUCTIONS ---
-                
-                # 1. Rating mapping transformation
-                if 'rating' in record:
-                    rating_value = record['rating']
-                    if rating_value == 's':
-                        # Delete the rating key entirely for 's' rating  
-                        del record['rating']
-                    else:
-                        # Transform rating values according to mapping
-                        rating_map = {'g': 'safe', 'q': 'questionable', 'e': 'explicit'}
-                        if rating_value in rating_map:
-                            record['rating'] = rating_map[rating_value]
-
-                # 2. Tags merge - combine all tag fields into single 'tags' field
-                tag_source_fields = [
-                    'tag_string_general',
-                    'tag_string_character',
-                    'tag_string_copyright', 
-                    'tag_string_artist',
-                    'tag_string_meta'
-                ]
-                
-                tag_parts = []
-                for field in tag_source_fields:
-                    if field in record:
-                        value = record.get(field, '')
-                        # Add non-empty values after stripping whitespace
-                        if value and str(value).strip():
-                            tag_parts.append(str(value).strip())
-
-                # Process and merge tags if any were found
-                if tag_parts:
-                    # Join all tag parts with spaces
-                    merged_tags = ' '.join(tag_parts)
-                    
-                    # Apply post-processing as specified
-                    merged_tags = merged_tags.lower()  # Convert to lowercase
-                    merged_tags = ' '.join(merged_tags.split())  # Collapse multiple spaces and strip
-                    
-                    # Remove duplicates while preserving order
-                    seen = set()
-                    unique_tags = []
-                    for tag in merged_tags.split():
-                        if tag not in seen:
-                            seen.add(tag)
-                            unique_tags.append(tag)
-                    
-                    record['tags'] = ' '.join(unique_tags)
-
-                # 3. Clean up extraneous fields - remove original tag columns
-                tag_fields_to_remove = [
-                    'tag_string_general',    # Added based on examples
-                    'tag_string_character',
-                    'tag_string_copyright',
-                    'tag_string_artist',
-                    'tag_string_meta'
-                ]
-                for field in tag_fields_to_remove:
-                    if field in record:
-                        del record[field]
-
-                # --- END TRANSFORMATIONS ---
-
-                with open(path, "w", encoding="utf-8") as fh:
-                    json.dump(record, fh, ensure_ascii=False, indent=2)
-
-            log.info(f"💾 Wrote {len(df):,} side-car JSON files to {dest_dir}")
-
-        # ── One master file (unchanged) ─────────────────────────────
-        else:
-            # This logic handles the case for a single master file output.
-            df_to_save = df.copy() # Create a copy to avoid modifying the original df
-
-            if cfg.strip_json_details:
-                # Drop the columns from the DataFrame before saving
-                columns_to_drop = [col for col in keys_to_strip if col in df_to_save.columns]
-                if columns_to_drop:
-                    df_to_save.drop(columns=columns_to_drop, inplace=True)
-                    log.info(f"Stripping columns from master file: {columns_to_drop}")
-
-            outfile = dest_dir / f"filtered_metadata.{cfg.filtered_metadata_format}"
-
-            if cfg.filtered_metadata_format == "json":
-                df_to_save.to_json(outfile, orient="records", lines=True, force_ascii=False)
-            elif cfg.filtered_metadata_format == "txt":
-                # The .txt output only contains file paths, so no changes needed here.
-                df[cfg.file_path_col].to_csv(outfile, index=False, header=False)
-
-            log.info(f"💾 Filtered metadata saved → {outfile}")
-
-    except Exception as e:
-        log.error(f"❌ Could not save filtered metadata: {e}")
-
-
-def download_with_datapool(df: pd.DataFrame, cfg: Config, dst: Path) -> None:
-    """Download images via CheeseChaser DataPool (deduplicated, resumable)."""
-    if DataPool is None:
-        log.error("CheeseChaser is not installed. Install with 'pip install cheesechaser'.")
-        log.error("Alternatively, use --no-download to skip this step.")
-        return
-
-    pool = DataPool()
-    ids = df[cfg.id_col].tolist()
-    log.info(f"Starting DataPool download of {len(ids)} images to {dst}...")
-    pool.batch_download_to_directory(
-        resource_ids=ids,
-        dst_dir=dst,
-        max_workers=cfg.workers
-    )
-    log.info("🎉 Download complete!")
-
-
-# Add this function before the main() function, around line 310
 
 def verify_hf_auth(cfg: Config) -> None:
-    """Checks if the Hugging Face token is valid before proceeding."""
+    """Verify Hugging Face authentication."""
     log.info("🔐 Verifying Hugging Face authentication...")
     token = cfg.hf_auth_token or HfFolder.get_token()
-
+    
     if not token:
         log.error("❌ No Hugging Face token found.")
-        log.error("Please set the 'hf_auth_token' in the script or run 'huggingface-cli login'.")
         sys.exit(1)
-
+    
     try:
         from huggingface_hub import HfApi
         user = HfApi().whoami(token=token)
-        log.info(f"✅ Successfully authenticated as Hugging Face user: {user['name']}")
+        log.info(f"✅ Authenticated as: {user['name']}")
     except Exception as e:
-        log.error("❌ Hugging Face authentication failed!")
-        log.error(f"The token is likely invalid or expired. Original error: {e}")
-        log.error("Please generate a new token with 'read' access from https://huggingface.co/settings/tokens")
+        log.error(f"❌ HF authentication failed: {e}")
         sys.exit(1)
 
 
 # ---------------------------------------------------------------------------
-# Main Execution
+# Main
 # ---------------------------------------------------------------------------
 def main() -> None:
-    """Main function to orchestrate the filtering and downloading process."""
-    # --- Configuration and Argument Parsing ---
+    """Main execution with all optimizations."""
+    # Setup
     cfg = Config()
     parser = build_cli()
     args = parser.parse_args()
     apply_cli_overrides(args, cfg)
-
-    # --- Setup Paths and Authentication ---
-    meta_path = Path(cfg.metadata_db_path)
+    
+    # Initialize components
+    stop_handler = SoftStopHandler()
     out_dir = Path(cfg.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-
+    
+    sharding = DirectorySharding(out_dir, cfg.files_per_shard)
+    json_writer = BatchedJSONWriter(sharding, cfg.json_batch_size, cfg.json_flush_interval)
+    
+    # Verify auth if downloading
     if cfg.download_images:
         verify_hf_auth(cfg)
-
-    # --- Load and Filter Data ---
-    df = load_metadata(meta_path, cfg)
-    log.info(f"Loaded {len(df):,} records.")
-
-    mask = build_filter_mask(df, cfg)
-    df_sub = df[mask].reset_index(drop=True)
-
-    match_count = len(df_sub)
-    log.info(f"✅ Found {match_count:,} records matching your criteria.")
-
-    # --- START: NEW LOGIC TO AVOID REDUNDANT WORK ---
-    # Check for existing files to avoid re-downloading or re-generating JSONs.
-    # This applies if we are downloading or saving per-image JSONs.
-    if not cfg.dry_run and (cfg.download_images or (cfg.save_filtered_metadata and cfg.per_image_json)):
-        log.info(f"Checking for existing files in {out_dir} to avoid duplicates...")
-        try:
-            # Create a set of IDs from filenames like '12345.jpg' or '12345.json'.
-            # p.stem extracts the '12345' part.
-            existing_ids = {int(p.stem) for p in out_dir.iterdir() if p.stem.isdigit()}
-
-            if existing_ids:
-                original_count = len(df_sub)
-                # Filter the dataframe, keeping only rows whose ID is NOT in the existing set.
-                df_sub = df_sub[~df_sub[cfg.id_col].isin(existing_ids)]
-                new_count = len(df_sub)
-                skipped_count = original_count - new_count
-                log.info(f"Skipped {skipped_count:,} items that already exist. {new_count:,} new items remain.")
-            else:
-                log.info("No existing items found. Proceeding with all matches.")
-        except Exception as e:
-            log.warning(f"Could not check for existing files due to an error: {e}. Proceeding without this check.")
-    # --- END: NEW LOGIC ---
-
-    if cfg.dry_run:
-        log.info(f"Dry run: Would attempt to process {len(df_sub):,} new items.")
-        return
-
-    if len(df_sub) == 0:
-        log.info("No new matching records to process. Exiting.")
-        return
-
-    # --- Execution Logic: Download First, then Conditionally Save Metadata ---
-
-    # 1. First, attempt to download images if requested.
-    if cfg.download_images:
-        download_with_datapool(df_sub, cfg, out_dir)
-
-        # 2. If metadata saving is also enabled, verify which downloads succeeded.
-        if cfg.save_filtered_metadata and cfg.per_image_json:
-            log.info("Verifying downloaded files before writing JSON metadata...")
-            
-            # Create a set of integer IDs from files that now exist in the output directory.
-            # Using p.stem correctly extracts the filename without the extension (e.g., "12345" from "12345.jpg").
-            existing_ids = {int(p.stem) for p in out_dir.iterdir() if p.stem.isdigit()}
-            
-            if not existing_ids:
-                log.warning("No images were successfully downloaded. Skipping metadata generation.")
-                return
-
-            # Filter the dataframe to only include rows for images that were actually downloaded.
-            df_to_save = df_sub[df_sub[cfg.id_col].isin(existing_ids)]
-            
-            log.info(f"Found {len(df_to_save):,} downloaded images. Now writing their corresponding metadata files...")
-            save_filtered_metadata(df_to_save, cfg, out_dir)
-        
-        elif cfg.save_filtered_metadata:
-             # This handles the case for a single master metadata file (not per-image).
-             log.info("Image download complete. Saving master metadata file.")
-             save_filtered_metadata(df_sub, cfg, out_dir)
-
-        else:
-             log.info("ℹ️ Image download complete. Metadata saving is disabled.")
-
-    # 3. Handle the case where we only save metadata without downloading.
-    elif cfg.save_filtered_metadata:
-        log.info("Image download is disabled. Saving metadata file(s) now.")
-        save_filtered_metadata(df_sub, cfg, out_dir)
     
-    else:
-        log.info("ℹ️ Image download and metadata saving are both disabled. Script finished.")
+    # Load and filter metadata using Polars
+    log.info("Loading and filtering metadata...")
+    lf = load_and_filter_metadata(cfg)
+    
+    # Count matches
+    match_count = lf.select(pl.count()).collect()[0, 0]
+    log.info(f"✅ Found {match_count:,} records matching criteria")
+    
+    if cfg.dry_run:
+        log.info(f"Dry run: Would process {match_count:,} items")
+        return
+    
+    if match_count == 0:
+        log.info("No matching records found.")
+        return
+    
+    # Process in streaming fashion
+    if cfg.download_images:
+        # For downloads, we need the full dataframe
+        df = lf.collect(streaming=True).to_pandas()
+        download_with_optimizations(df, cfg, sharding, json_writer, stop_handler)
+    elif cfg.save_filtered_metadata and not cfg.per_image_json:
+        # Save as single file
+        df = lf.collect(streaming=True).to_pandas()
+        outfile = out_dir / f"filtered_metadata.{cfg.filtered_metadata_format}"
+        if cfg.filtered_metadata_format == "json":
+            df.to_json(outfile, orient="records", lines=True, force_ascii=False)
+        log.info(f"💾 Saved metadata to {outfile}")
+    
+    log.info("🎉 Processing complete!")
+
 
 if __name__ == "__main__":
     main()
