@@ -43,8 +43,8 @@ class Config:
     """Holds all runtime parameters (may be overridden from CLI)."""
 
     # ---- Paths ------------------------------------------------------------
-    metadata_db_path: str = r"J:\New file\Danbooru2004\metadata.parquet"
-    output_dir: str = r"J:\New file\Danbooru2004\Images"
+    metadata_db_path: str = r"/media/andrewk/qnap-public/New file/Danbooru2004/metadata.parquet"
+    output_dir: str = r"/mnt/raid0/DAb/"
 
     # ---- Hugging Face -----------------------------------------------------
     dataset_repo: str = "deepghs/danbooru2024"
@@ -63,14 +63,14 @@ class Config:
     id_col: str = "id"
 
     # ---- Filtering Toggles (Set to False to disable a filter group) ------
-    enable_include_tags: bool = True
-    enable_exclude_tags: bool = True
-    #enable_character_filtering: bool = False # <-- SET TO FALSE
-    #enable_copyright_filtering: bool = False # <-- SET TO FALSE
-    #enable_artist_filtering: bool = False # <-- SET TO FALSE
-    enable_score_filtering: bool = True
+    enable_include_tags: bool = False
+    enable_exclude_tags: bool = False
+    enable_character_filtering: bool = False # <-- SET TO FALSE
+    enable_copyright_filtering: bool = False # <-- SET TO FALSE
+    enable_artist_filtering: bool = False # <-- SET TO FALSE
+    enable_score_filtering: bool = False
     enable_rating_filtering: bool = False
-    enable_dimension_filtering: bool = True 
+    enable_dimension_filtering: bool = False
     per_image_json: bool = True
 
     # ---- Filtering Criteria (with placeholders) ---------------------------
@@ -479,7 +479,6 @@ def save_filtered_metadata(df: pd.DataFrame, cfg: Config, dest_dir: Path) -> Non
                 # Convert row to a dictionary, dropping any NaN values
                 record = row.dropna().to_dict()
 
-                # --- START: MODIFIED LOGIC ---
                 # Remove the file path column as it's not needed in the side-car
                 if cfg.file_path_col in record:
                     del record[cfg.file_path_col]
@@ -489,14 +488,77 @@ def save_filtered_metadata(df: pd.DataFrame, cfg: Config, dest_dir: Path) -> Non
                     for key in keys_to_strip:
                         if key in record:
                             del record[key]
-                # --- END: MODIFIED LOGIC ---
+
+                # --- APPLY JSON TRANSFORMATIONS PER INSTRUCTIONS ---
+                
+                # 1. Rating mapping transformation
+                if 'rating' in record:
+                    rating_value = record['rating']
+                    if rating_value == 's':
+                        # Delete the rating key entirely for 's' rating  
+                        del record['rating']
+                    else:
+                        # Transform rating values according to mapping
+                        rating_map = {'g': 'safe', 'q': 'questionable', 'e': 'explicit'}
+                        if rating_value in rating_map:
+                            record['rating'] = rating_map[rating_value]
+
+                # 2. Tags merge - combine all tag fields into single 'tags' field
+                tag_source_fields = [
+                    'tag_string_general',
+                    'tag_string_character',
+                    'tag_string_copyright', 
+                    'tag_string_artist',
+                    'tag_string_meta'
+                ]
+                
+                tag_parts = []
+                for field in tag_source_fields:
+                    if field in record:
+                        value = record.get(field, '')
+                        # Add non-empty values after stripping whitespace
+                        if value and str(value).strip():
+                            tag_parts.append(str(value).strip())
+
+                # Process and merge tags if any were found
+                if tag_parts:
+                    # Join all tag parts with spaces
+                    merged_tags = ' '.join(tag_parts)
+                    
+                    # Apply post-processing as specified
+                    merged_tags = merged_tags.lower()  # Convert to lowercase
+                    merged_tags = ' '.join(merged_tags.split())  # Collapse multiple spaces and strip
+                    
+                    # Remove duplicates while preserving order
+                    seen = set()
+                    unique_tags = []
+                    for tag in merged_tags.split():
+                        if tag not in seen:
+                            seen.add(tag)
+                            unique_tags.append(tag)
+                    
+                    record['tags'] = ' '.join(unique_tags)
+
+                # 3. Clean up extraneous fields - remove original tag columns
+                tag_fields_to_remove = [
+                    'tag_string_general',    # Added based on examples
+                    'tag_string_character',
+                    'tag_string_copyright',
+                    'tag_string_artist',
+                    'tag_string_meta'
+                ]
+                for field in tag_fields_to_remove:
+                    if field in record:
+                        del record[field]
+
+                # --- END TRANSFORMATIONS ---
 
                 with open(path, "w", encoding="utf-8") as fh:
                     json.dump(record, fh, ensure_ascii=False, indent=2)
 
             log.info(f"💾 Wrote {len(df):,} side-car JSON files to {dest_dir}")
 
-        # ── One master file ─────────────────────────────────────────
+        # ── One master file (unchanged) ─────────────────────────────
         else:
             # This logic handles the case for a single master file output.
             df_to_save = df.copy() # Create a copy to avoid modifying the original df
@@ -507,7 +569,6 @@ def save_filtered_metadata(df: pd.DataFrame, cfg: Config, dest_dir: Path) -> Non
                 if columns_to_drop:
                     df_to_save.drop(columns=columns_to_drop, inplace=True)
                     log.info(f"Stripping columns from master file: {columns_to_drop}")
-
 
             outfile = dest_dir / f"filtered_metadata.{cfg.filtered_metadata_format}"
 
