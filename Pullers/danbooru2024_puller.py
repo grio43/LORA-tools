@@ -67,14 +67,14 @@ class Config:
     id_col: str = "id"
 
     # ---- Filtering Toggles (Set to False to disable a filter group) ------
-    enable_include_tags: bool = False
-    enable_exclude_tags: bool = False
+    enable_include_tags: bool = True
+    enable_exclude_tags: bool = True
     enable_character_filtering: bool = False # <-- SET TO FALSE
     enable_copyright_filtering: bool = False # <-- SET TO FALSE
     enable_artist_filtering: bool = False # <-- SET TO FALSE
-    enable_score_filtering: bool = False
+    enable_score_filtering: bool = True
     enable_rating_filtering: bool = False
-    enable_dimension_filtering: bool = False 
+    enable_dimension_filtering: bool = True 
     per_image_json: bool = True
 
     # ---- Filtering Criteria (with placeholders) ---------------------------
