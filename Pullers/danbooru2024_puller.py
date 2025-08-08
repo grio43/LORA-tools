@@ -67,14 +67,14 @@ class Config:
     id_col: str = "id"
 
     # ---- Filtering Toggles (Set to False to disable a filter group) ------
-    enable_include_tags: bool = True
-    enable_exclude_tags: bool = True
+    enable_include_tags: bool = False
+    enable_exclude_tags: bool = False
     enable_character_filtering: bool = False # <-- SET TO FALSE
     enable_copyright_filtering: bool = False # <-- SET TO FALSE
     enable_artist_filtering: bool = False # <-- SET TO FALSE
-    enable_score_filtering: bool = True
+    enable_score_filtering: bool = False
     enable_rating_filtering: bool = False
-    enable_dimension_filtering: bool = True 
+    enable_dimension_filtering: bool = False 
     per_image_json: bool = True
 
     # ---- Filtering Criteria (with placeholders) ---------------------------
@@ -269,10 +269,29 @@ def load_metadata(path: Path, cfg: Config) -> pd.DataFrame:
         sys.exit(1)
 
     # Build the projected column set exactly like before
+    # cols_to_load: set[str] = set()
+    # if (cfg.enable_include_tags or cfg.enable_exclude_tags or
+    #         (cfg.save_filtered_metadata and cfg.per_image_json)):
+    #     cols_to_load.add(cfg.tags_col)
+
+    # Build the projected column set exactly like before
     cols_to_load: set[str] = set()
     if (cfg.enable_include_tags or cfg.enable_exclude_tags or
             (cfg.save_filtered_metadata and cfg.per_image_json)):
-        cols_to_load.add(cfg.tags_col)
+        cols_to_load.update([
+            cfg.tags_col,
+            cfg.character_tags_col,
+            cfg.copyright_tags_col,
+            cfg.artist_tags_col,
+            "tag_string_meta"
+        ])
+
+        # ✅ Ensure rating is always loaded if metadata is saved
+        if cfg.enable_rating_filtering or cfg.save_filtered_metadata:
+            cols_to_load.add(cfg.rating_col)
+
+
+
     if cfg.enable_score_filtering:        cols_to_load.add(cfg.score_col)
     if cfg.enable_rating_filtering:       cols_to_load.add(cfg.rating_col)
     if cfg.enable_dimension_filtering:    cols_to_load.update([cfg.width_col, cfg.height_col])
@@ -332,14 +351,27 @@ def load_metadata(path: Path, cfg: Config) -> pd.DataFrame:
         )
 
     # Normalize all tag columns
+
+    # Normalize all tag columns including "tag_string_meta"
     for col in (
         cfg.tags_col,
-        cfg.character_tags_col, # <-- Keep these commented if the filters are off
+        cfg.character_tags_col,
         cfg.copyright_tags_col,
         cfg.artist_tags_col,
+        "tag_string_meta",
     ):
         if col in df.columns:
             df[col] = _normalise(df[col])
+
+
+    # for col in (
+    #     cfg.tags_col,
+    #     cfg.character_tags_col, # <-- Keep these commented if the filters are off
+    #     cfg.copyright_tags_col,
+    #     cfg.artist_tags_col,
+    # ):
+    #     if col in df.columns:
+    #         df[col] = _normalise(df[col])
 
     return df
 
@@ -447,9 +479,15 @@ def build_filter_mask(df: pd.DataFrame, cfg: Config) -> pd.Series:
         mask &= df[cfg.score_col].fillna(0) >= cfg.min_score
 
     # Ratings
-    if cfg.enable_rating_filtering and cfg.ratings:
-        log.info(f"    Filtering for ratings: {cfg.ratings}")
-        mask &= df[cfg.rating_col].fillna("").isin(cfg.ratings)
+    # if cfg.enable_rating_filtering and cfg.ratings:
+    #     log.info(f"    Filtering for ratings: {cfg.ratings}")
+    #     mask &= df[cfg.rating_col].fillna("").isin(cfg.ratings)
+
+    if cfg.rating_col in df.columns:
+        log.info("    Normalizing ratings and excluding 's'")
+        df[cfg.rating_col] = df[cfg.rating_col].astype(str).str.lower().map(normalize_danbooru_rating)
+        mask &= df[cfg.rating_col].notnull()
+
 
     # Dimensions
     if cfg.enable_dimension_filtering:
@@ -466,65 +504,127 @@ def build_filter_mask(df: pd.DataFrame, cfg: Config) -> pd.Series:
             
     return mask
 
-# ---------------------------------------------------------------------------
-# Output and Download Helpers
-# ---------------------------------------------------------------------------
-def save_filtered_metadata(df: pd.DataFrame, cfg: Config, dest_dir: Path) -> None:
-    """Save metadata either as one big file or as one JSON per image."""
-    keys_to_strip = [cfg.score_col, cfg.width_col, cfg.height_col]
 
+
+def normalize_danbooru_rating(rating: str) -> str:
+    rating = rating.strip().lower()
+    if rating in ["e", "explicit"]:
+        return "explicit"
+    elif rating in ["q", "questionable"]:
+        return "questionable"
+    elif rating in ["s", "safe"]:
+        return "safe"
+    elif rating in ["g", "general"]:
+        return "general"
+    return "unknown"
+
+
+def save_filtered_metadata(df: pd.DataFrame, cfg: Config, dest_dir: Path) -> None:
+    """Save metadata in Rule34-compatible format with per-image JSON files."""
     try:
-        # ── Per-image side-cars ──────────────────────────────────────
+        # ── Per-image sidecars ────────────────────────────────────────────────────────────────────────────────────────────────────
         if cfg.filtered_metadata_format == "json" and cfg.per_image_json:
             for _, row in df.iterrows():
-                image_id = row[cfg.id_col]
-                path = dest_dir / f"{image_id}.json"
+                try:
+                    file_url = row.get(cfg.file_path_col)
+                    if not isinstance(file_url, str) or not file_url:
+                        log.warning(f"Missing file_url for ID {row.get(cfg.id_col)}; defaulting to .jpg")
+                        ext = ".jpg"
+                    else:
+                        ext = os.path.splitext(file_url)[-1].lower()
+                        if ext not in [".jpg", ".jpeg", ".png", ".webp", ".gif"]:
+                            ext = ".jpg"
 
-                # Convert row to a dictionary, dropping any NaN values
-                record = row.dropna().to_dict()
+                    image_id = row[cfg.id_col]
+                    filename = f"{image_id}{ext}"
 
-                # --- START: MODIFIED LOGIC ---
-                # Remove the file path column as it's not needed in the side-car
-                if cfg.file_path_col in record:
-                    del record[cfg.file_path_col]
+                    rating_raw = str(row.get(cfg.rating_col, "")).strip().lower()
+                    rating = normalize_danbooru_rating(rating_raw)
 
-                # If the strip flag is on, remove the specified keys
-                if cfg.strip_json_details:
-                    for key in keys_to_strip:
-                        if key in record:
-                            del record[key]
-                # --- END: MODIFIED LOGIC ---
+                    if rating == "unknown":
+                        log.warning(f"ID {row.get(cfg.id_col)} has unrecognized rating '{rating_raw}' — using 'unknown'")
 
-                with open(path, "w", encoding="utf-8") as fh:
-                    json.dump(record, fh, ensure_ascii=False, indent=2)
 
-            log.info(f"💾 Wrote {len(df):,} side-car JSON files to {dest_dir}")
+                    tag_cols = [
+                        cfg.tags_col,
+                        cfg.character_tags_col,
+                        cfg.copyright_tags_col,
+                        cfg.artist_tags_col,
+                        "tag_string_meta"
+                    ]
+                    tags = [row[col] for col in tag_cols if col in row and isinstance(row[col], str)]
+                    tag_string = " ".join(tags).strip()
 
-        # ── One master file ─────────────────────────────────────────
+                    record = {
+                        "filename": filename,
+                        "rating": rating,
+                        "tags": tag_string
+                    }
+
+                    path = dest_dir / f"{image_id}.json"
+                    with open(path, "w", encoding="utf-8") as fh:
+                        json.dump(record, fh, ensure_ascii=False, indent=2)
+
+                except Exception as e:
+                    log.error(f"❌ Failed to write JSON for ID {row.get(cfg.id_col)}: {e}")
+                    continue
+
+            log.info(f"📎 Wrote {len(df):,} Rule34-style JSON files to {dest_dir}")
+
+        # ── One master file (e.g., JSONL) ──────────────────────────────────────────────────────────────────────────
         else:
-            # This logic handles the case for a single master file output.
-            df_to_save = df.copy() # Create a copy to avoid modifying the original df
+            records = []
+            for _, row in df.iterrows():
+                try:
+                    file_url = row.get(cfg.file_path_col, "")
+                    ext = os.path.splitext(file_url)[-1].lower() or ".jpg"
+                    if ext not in [".jpg", ".jpeg", ".png", ".webp", ".gif"]:
+                        ext = ".jpg"
+                    image_id = row[cfg.id_col]
+                    filename = f"{image_id}{ext}"
 
-            if cfg.strip_json_details:
-                # Drop the columns from the DataFrame before saving
-                columns_to_drop = [col for col in keys_to_strip if col in df_to_save.columns]
-                if columns_to_drop:
-                    df_to_save.drop(columns=columns_to_drop, inplace=True)
-                    log.info(f"Stripping columns from master file: {columns_to_drop}")
+                    rating_raw = str(row.get(cfg.rating_col, "")).strip().lower()
+                    rating = normalize_danbooru_rating(rating_raw)
+                    if not rating:
+                        rating = "unknown"
 
+                    tag_cols = [
+                        cfg.tags_col,
+                        cfg.character_tags_col,
+                        cfg.copyright_tags_col,
+                        cfg.artist_tags_col,
+                        "tag_string_meta"
+                    ]
+                    tags = [row[col] for col in tag_cols if col in row and isinstance(row[col], str)]
+                    tag_string = " ".join(tags).strip()
+
+                    record = {
+                        "filename": filename,
+                        "rating": rating,
+                        "tags": tag_string
+                    }
+
+                    records.append(record)
+
+                except Exception as e:
+                    log.error(f"❌ Failed to build record for ID {row.get(cfg.id_col)}: {e}")
+                    continue
 
             outfile = dest_dir / f"filtered_metadata.{cfg.filtered_metadata_format}"
-
             if cfg.filtered_metadata_format == "json":
-                df_to_save.to_json(outfile, orient="records", lines=True, force_ascii=False)
+                with open(outfile, "w", encoding="utf-8") as f:
+                    json.dump(records, f, indent=2, ensure_ascii=False)
             elif cfg.filtered_metadata_format == "txt":
-                # The .txt output only contains file paths, so no changes needed here.
-                df[cfg.file_path_col].to_csv(outfile, index=False, header=False)
+                with open(outfile, "w", encoding="utf-8") as f:
+                    for r in records:
+                        f.write(f"{r['filename']}\n")
 
-            log.info(f"💾 Filtered metadata saved → {outfile}")
+            log.info(f"📎 Saved {len(records):,} entries to {outfile}")
 
     except Exception as e:
-        log.error(f"❌ Could not save filtered metadata: {e}")
+        log.error(f"❌ Could not save metadata: {e}")
+
+
 
 
 def download_with_datapool(df: pd.DataFrame, cfg: Config, dst: Path) -> None:
