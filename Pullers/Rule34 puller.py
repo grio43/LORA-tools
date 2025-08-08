@@ -354,7 +354,7 @@ class Config:
     dry_run: bool = False
 
     # ---- Performance ------------------------------------------------------
-    workers: int = 15
+    workers: int = 25
     batch_size: int = 1000
     
     # ---- New performance settings ----------------------------------------
