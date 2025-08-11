@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 Enhanced Danbooru dataset filtering and downloading script with:
+- File validation on startup to detect missing files
 - Progress tracking and resumability
 - Directory sharding for O(1) lookups
 - Memory-efficient streaming
@@ -25,17 +26,22 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional, Iterator, Dict, Any, Set
+from typing import List, Optional, Iterator, Dict, Any, Set, Tuple
+
 
 import polars as pl
 import pandas as pd
 from huggingface_hub import HfFolder, login
+from tqdm import tqdm
 
 try:
     # Requires cheesechaser >= 0.5.0
     from cheesechaser.datapool import DanbooruNewestDataPool as DataPool
 except ModuleNotFoundError:  # graceful degradation
     DataPool = None
+
+# Global download lock for thread safety
+DOWNLOAD_LOCK = threading.Lock()
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -44,17 +50,76 @@ logging.basicConfig(format="%(levelname)s: %(message)s", level=logging.INFO)
 log = logging.getLogger("cheesechaser_search")
 
 # ---------------------------------------------------------------------------
-# Progress Tracking
+# Directory Sharding
 # ---------------------------------------------------------------------------
-class ProgressTracker:
-    """Tracks download progress with atomic updates and persistent records."""
+class DirectorySharding:
+    """Manages single-level directory sharding for O(1) lookups."""
+    
+    def __init__(self, base_dir: Path, files_per_dir: int = 5000):
+        """Initialize the sharding system."""
+        self.base_dir = base_dir
+        self.files_per_dir = files_per_dir
+        self.base_dir.mkdir(parents=True, exist_ok=True)
+    
+    def get_shard_path(self, image_id: int) -> Path:
+        """Get the shard directory path for a given image ID."""
+        shard_index = image_id // self.files_per_dir
+        shard_name = f"shard_{shard_index:05d}"
+        shard_path = self.base_dir / shard_name
+        try:
+            shard_path.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            log.error(f"Failed to create shard directory {shard_path}: {e}")
+            raise
+        return shard_path
+    
+    def file_exists(self, image_id: int) -> Tuple[bool, Optional[str]]:
+        """
+        Check if file exists in the specific shard directory.
+        Returns (exists, extension) tuple.
+        """
+        shard_path = self.get_shard_path(image_id)
+        extensions = ['.jpg', '.jpeg', '.png', '.gif', '.webp']
+        for ext in extensions:
+            if (shard_path / f"{image_id}{ext}").exists():
+                return True, ext
+        return False, None
+    
+    def get_all_existing_files(self) -> Set[int]:
+        """Scan all shard directories and return set of existing file IDs."""
+        existing_ids = set()
+        if not self.base_dir.exists():
+            return existing_ids
+        
+        # Pattern to match image files
+        image_pattern = re.compile(r'^(\d+)\.(jpg|jpeg|png|gif|webp)$', re.IGNORECASE)
+        
+        # Scan all shard directories
+        for shard_dir in self.base_dir.glob("shard_*"):
+            if shard_dir.is_dir():
+                for file_path in shard_dir.iterdir():
+                    if file_path.is_file():
+                        match = image_pattern.match(file_path.name)
+                        if match:
+                            image_id = int(match.group(1))
+                            existing_ids.add(image_id)
+        
+        return existing_ids
+
+# ---------------------------------------------------------------------------
+# Enhanced Progress Tracking with Validation
+# ---------------------------------------------------------------------------
+class ValidatingProgressTracker:
+    """Tracks download progress with validation and persistent records."""
     
     def __init__(self, progress_file: Path, update_interval: int = 100):
         self.progress_file = progress_file
         self.update_interval = update_interval
         self.completed_ids: Set[int] = set()
+        self.missing_ids: Set[int] = set()  # Track files that went missing
         self.update_counter = 0
         self.lock = threading.Lock()
+        self.validation_performed = False
         self._load_progress()
     
     def _load_progress(self):
@@ -64,14 +129,154 @@ class ProgressTracker:
                 with open(self.progress_file, 'r') as f:
                     data = json.load(f)
                     self.completed_ids = set(data.get('completed_ids', []))
+                    self.missing_ids = set(data.get('missing_ids', []))
                 log.info(f"📈 Loaded progress: {len(self.completed_ids):,} completed downloads")
+                if self.missing_ids:
+                    log.warning(f"⚠️  Found {len(self.missing_ids):,} previously missing files in records")
             except Exception as e:
                 log.warning(f"⚠️  Failed to load progress file: {e}")
+    
+    def validate_files(self, sharding: DirectorySharding, auto_clean: bool = True) -> Dict[str, Any]:
+        """
+        Validate that all "completed" files actually exist on disk.
+        Returns statistics about the validation.
+        """
+        log.info("🔍 Starting file validation...")
+        
+        # Create a copy to iterate over safely
+        with self.lock:
+            ids_to_check = self.completed_ids.copy()
+        
+        log.info(f"   Checking {len(ids_to_check):,} files marked as completed...")
+        
+        stats = {
+            'total_marked_complete': len(ids_to_check),
+            'files_verified': 0,
+            'files_missing': 0,
+            'files_recovered': 0,  # Previously missing files that are now present
+            'validation_time': 0
+        }
+        
+        start_time = time.time()
+        
+        # Check each completed ID
+        missing_now = set()
+        verified = set()
+        recovered = set()
+        
+        with tqdm(total=len(ids_to_check), desc="Validating files", unit="files") as pbar:
+            for image_id in ids_to_check:  # Use the copy
+                exists, ext = sharding.file_exists(image_id)
+                if exists:
+                    verified.add(image_id)
+                    # Check if this file was previously marked as missing
+                    if image_id in self.missing_ids:
+                        recovered.add(image_id)
+                else:
+                    missing_now.add(image_id)
+                pbar.update(1)
+        
+        stats['files_verified'] = len(verified)
+        stats['files_missing'] = len(missing_now)
+        stats['files_recovered'] = len(recovered)
+        stats['validation_time'] = time.time() - start_time
+        
+        # Report findings
+        log.info(f"✅ Validation complete in {stats['validation_time']:.1f}s:")
+        log.info(f"   • Files verified: {stats['files_verified']:,}")
+        log.info(f"   • Files missing: {stats['files_missing']:,}")
+        if stats['files_recovered'] > 0:
+            log.info(f"   • Files recovered: {stats['files_recovered']:,}")
+        
+        # Update internal state with proper locking
+        if missing_now and auto_clean:
+            log.warning(f"⚠️  Removing {len(missing_now):,} missing files from completed list...")
+            with self.lock:
+                # Remove missing files from completed set
+                self.completed_ids -= missing_now
+                # Remove recovered files from missing set
+                self.missing_ids -= recovered
+                # Add newly missing files to missing set
+                self.missing_ids.update(missing_now)
+                self._save_progress()
+            log.info(f"✅ Progress file cleaned. Ready to re-download missing files.")
+        elif missing_now:
+            log.warning(f"⚠️  Found {len(missing_now):,} missing files but auto_clean is disabled")
+        elif recovered:
+            # Even if no missing files, we should still update if files were recovered
+            with self.lock:
+                self.missing_ids -= recovered
+                self._save_progress()
+            log.info(f"✅ Updated progress file to reflect {len(recovered):,} recovered files")
+        
+        self.validation_performed = True
+        return stats
+    
+    def full_filesystem_scan(self, sharding: DirectorySharding) -> Dict[str, Any]:
+        """
+        Perform a complete filesystem scan to find all image files,
+        then reconcile with progress tracker.
+        """
+        log.info("🔍 Performing full filesystem scan...")
+        
+        stats = {
+            'files_on_disk': 0,
+            'files_in_tracker': len(self.completed_ids),
+            'untracked_files': 0,
+            'missing_from_disk': 0,
+            'scan_time': 0
+        }
+        
+        start_time = time.time()
+        
+        # Get all files from filesystem
+        log.info("   Scanning all shard directories...")
+        files_on_disk = sharding.get_all_existing_files()
+        
+        stats['files_on_disk'] = len(files_on_disk)
+        
+        # Find discrepancies
+        untracked = files_on_disk - self.completed_ids
+        missing = self.completed_ids - files_on_disk
+        
+        stats['untracked_files'] = len(untracked)
+        stats['missing_from_disk'] = len(missing)
+        stats['scan_time'] = time.time() - start_time
+        
+        # Report findings
+        log.info(f"✅ Filesystem scan complete in {stats['scan_time']:.1f}s:")
+        log.info(f"   • Total files on disk: {stats['files_on_disk']:,}")
+        log.info(f"   • Files in tracker: {stats['files_in_tracker']:,}")
+        log.info(f"   • Untracked files found: {stats['untracked_files']:,}")
+        log.info(f"   • Missing from disk: {stats['missing_from_disk']:,}")
+        
+        # Optionally fix discrepancies
+        if untracked:
+            log.info(f"💡 Found {len(untracked):,} files on disk not in progress tracker")
+            response = input("   Add these to completed list? (y/n): ").strip().lower()
+            if response == 'y':
+                with self.lock:
+                    self.completed_ids.update(untracked)
+                    self._save_progress()
+                log.info(f"✅ Added {len(untracked):,} files to progress tracker")
+        
+        if missing:
+            log.warning(f"⚠️  Found {len(missing):,} files in tracker but missing from disk")
+            response = input("   Remove these from completed list? (y/n): ").strip().lower()
+            if response == 'y':
+                with self.lock:
+                    self.completed_ids -= missing
+                    self.missing_ids.update(missing)
+                    self._save_progress()
+                log.info(f"✅ Cleaned {len(missing):,} missing entries from progress tracker")
+        
+        return stats
     
     def mark_completed(self, image_id: int):
         """Mark an image as completed and update progress file atomically."""
         with self.lock:
             self.completed_ids.add(image_id)
+            self.missing_ids.discard(image_id)  # Remove from missing if it was there
             self.update_counter += 1
             
             if self.update_counter >= self.update_interval:
@@ -82,8 +287,10 @@ class ProgressTracker:
         """Save progress to file atomically."""
         data = {
             'completed_ids': sorted(list(self.completed_ids)),
+            'missing_ids': sorted(list(self.missing_ids)),
             'last_updated': time.time(),
-            'total_completed': len(self.completed_ids)
+            'total_completed': len(self.completed_ids),
+            'total_missing': len(self.missing_ids)
         }
         
         tmp_path = self.progress_file.with_suffix('.tmp')
@@ -105,34 +312,14 @@ class ProgressTracker:
         """Force save progress file."""
         with self.lock:
             self._save_progress()
-
-# ---------------------------------------------------------------------------
-# Directory Sharding
-# ---------------------------------------------------------------------------
-class DirectorySharding:
-    """Manages single-level directory sharding for O(1) lookups."""
     
-    def __init__(self, base_dir: Path, files_per_dir: int = 5000):
-        self.base_dir = base_dir
-        self.files_per_dir = files_per_dir
-        self.base_dir.mkdir(parents=True, exist_ok=True)
-    
-    def get_shard_path(self, image_id: int) -> Path:
-        """Get the shard directory path for a given image ID."""
-        shard_index = image_id // self.files_per_dir
-        shard_name = f"shard_{shard_index:05d}"
-        shard_path = self.base_dir / shard_name
-        shard_path.mkdir(parents=True, exist_ok=True)
-        return shard_path
-    
-    def file_exists(self, image_id: int) -> bool:
-        """Check if file exists in the specific shard directory."""
-        shard_path = self.get_shard_path(image_id)
-        extensions = ['.jpg', '.jpeg', '.png', '.gif', '.webp']
-        for ext in extensions:
-            if (shard_path / f"{image_id}{ext}").exists():
-                return True
-        return False
+    def get_statistics(self) -> Dict[str, int]:
+        """Get current statistics."""
+        return {
+            'completed': len(self.completed_ids),
+            'missing': len(self.missing_ids),
+            'total_processed': len(self.completed_ids) + len(self.missing_ids)
+        }
 
 # ---------------------------------------------------------------------------
 # Batched JSON Writer
@@ -203,6 +390,9 @@ class BatchedJSONWriter:
         with self.lock:
             self._closed = True
             self._flush_buffer()
+        # Wait for flush thread to complete
+        if self._flush_thread and self._flush_thread.is_alive():
+            self._flush_thread.join(timeout=1.0)
 
 # ---------------------------------------------------------------------------
 # Signal Handler
@@ -312,12 +502,14 @@ class Config:
     strip_json_details: bool = True
     exclude_gifs: bool = True
     dry_run: bool = False
+    validate_on_start: bool = True  # New: validate files on startup
+    full_scan: bool = False  # New: perform full filesystem scan
 
     # ---- Performance ------------------------------------------------------
-    workers: int = 15
-    files_per_shard: int = 5000  # New: directory sharding
-    batch_size: int = 10000  # New: streaming batch size
-    use_streaming: bool = True  # New: enable memory-efficient streaming
+    workers: int = 12
+    files_per_shard: int = 5000
+    batch_size: int = 5000
+    use_streaming: bool = True
 
 # ---------------------------------------------------------------------------
 # CLI
@@ -330,19 +522,19 @@ def build_cli() -> argparse.ArgumentParser:
     """Defines and configures the command-line argument parser."""
     p = argparse.ArgumentParser(
         prog="cheesechaser-search",
-        description="Filter Danbooru metadata & optionally download matching images.",
+        description="Filter Danbooru metadata & optionally download matching images with file validation.",
         formatter_class=argparse.RawTextHelpFormatter,
         epilog=textwrap.dedent("""
             Example Usage:
             --------------
-            # Download high-scoring images of '1girl' to a specific folder
+            # Download with automatic validation on startup
             python search.py --metadata /data/danbooru.parquet --include "1girl solo" --min-score 100 --output ./My_Filtered_Images
 
-            # Filter for square images that are at least 1024x1024, excluding certain tags
-            python search.py --square --min-square-size 1024 --exclude "multiple_girls nsfw"
+            # Perform full filesystem scan to find untracked files
+            python search.py --full-scan --output ./My_Filtered_Images
 
-            # Perform a dry run to see match count without downloading or saving metadata
-            python search.py --include cat_ears --dry-run
+            # Skip validation for faster startup (not recommended)
+            python search.py --no-validate --include cat_ears --output ./output
             """),
     )
 
@@ -373,7 +565,13 @@ def build_cli() -> argparse.ArgumentParser:
     p.add_argument("--dry-run", action="store_true", help="Exit after stats")
     p.add_argument("--exclude-gifs", action="store_true", help="Exclude .gif files")
     
-    # Performance (new)
+    # Validation flags (new)
+    p.add_argument("--no-validate", dest="validate", action="store_false", 
+                   help="Skip file validation on startup")
+    p.add_argument("--full-scan", action="store_true", 
+                   help="Perform full filesystem scan to find all files")
+    
+    # Performance
     p.add_argument("--workers", type=int, help="Number of download workers")
     p.add_argument("--files-per-shard", type=int, help="Files per directory shard")
     p.add_argument("--batch-size", type=int, help="Streaming batch size")
@@ -388,8 +586,12 @@ def apply_cli_overrides(args: argparse.Namespace, cfg: Config) -> None:
     if args.repo: cfg.dataset_repo = args.repo
     if args.token: cfg.hf_auth_token = args.token
 
-    if args.include is not None: cfg.include_tags = args.include
-    if args.exclude is not None: cfg.exclude_tags = args.exclude
+    if args.include is not None: 
+        cfg.include_tags = args.include
+        cfg.enable_include_tags = True  # Enable the filter
+    if args.exclude is not None: 
+        cfg.exclude_tags = args.exclude
+        cfg.enable_exclude_tags = True  
     if args.min_score is not None: cfg.min_score = args.min_score
     if args.ratings is not None: cfg.ratings = args.ratings
     if args.square: cfg.square_only = True
@@ -411,6 +613,11 @@ def apply_cli_overrides(args: argparse.Namespace, cfg: Config) -> None:
         cfg.download_images = False
     if hasattr(args, 'save_meta') and not args.save_meta:
         cfg.save_filtered_metadata = False
+    
+    if hasattr(args, 'validate') and not args.validate:
+        cfg.validate_on_start = False
+    if args.full_scan:
+        cfg.full_scan = True
 
     if args.dry_run:
         cfg.dry_run = True
@@ -618,18 +825,19 @@ def prepare_json_data(row: Dict[str, Any], cfg: Config) -> Dict[str, Any]:
 
 def download_single_with_json(row: Dict[str, Any], cfg: Config, 
                              shard_dir: Path, json_writer: Optional[BatchedJSONWriter],
-                             progress_tracker: ProgressTracker, 
+                             progress_tracker: ValidatingProgressTracker, 
                              pool: DataPool) -> bool:
     """Download single image with JSON metadata."""
     image_id = row[cfg.id_col]
     
     try:
         # Download image
-        pool.batch_download_to_directory(
-            resource_ids=[image_id],
-            dst_dir=shard_dir,
-            max_workers=1
-        )
+        with DOWNLOAD_LOCK:
+            pool.batch_download_to_directory(
+                resource_ids=[image_id],
+                dst_dir=shard_dir,
+                max_workers=1
+            )
         
         # Only write JSON after successful download
         if cfg.per_image_json and json_writer:
@@ -645,21 +853,27 @@ def download_single_with_json(row: Dict[str, Any], cfg: Config,
         log.error(f"❌ Failed {image_id}: {e}")
         return False
 
-def process_downloads_optimized(metadata_stream: Iterator[Dict[str, Any]], 
+def process_downloads_validated(metadata_stream: Iterator[Dict[str, Any]], 
                                cfg: Config, dest_dir: Path,
                                stop_handler: Optional[SoftStopHandler] = None) -> None:
     """
-    Process downloads with all optimizations:
-    - Progress tracking & resumability
-    - Directory sharding
-    - Batched JSON writing
-    - Bounded concurrency
-    - Graceful interruption
+    Process downloads with validation support.
     """
     # Initialize all systems
     sharding = DirectorySharding(dest_dir, cfg.files_per_shard)
     json_writer = BatchedJSONWriter(flush_interval=5.0, batch_size=100) if cfg.per_image_json else None
-    progress_tracker = ProgressTracker(dest_dir / "progress.json")
+    progress_tracker = ValidatingProgressTracker(dest_dir / "progress.json")
+    
+    # Perform validation if enabled
+    if cfg.validate_on_start:
+        if cfg.full_scan:
+            progress_tracker.full_filesystem_scan(sharding)
+        else:
+            progress_tracker.validate_files(sharding, auto_clean=True)
+    
+    # Show current statistics
+    stats = progress_tracker.get_statistics()
+    log.info(f"📊 Starting with {stats['completed']:,} completed, {stats['missing']:,} missing")
     
     if DataPool is None:
         log.error("CheeseChaser not installed. Install with 'pip install cheesechaser'.")
@@ -670,11 +884,12 @@ def process_downloads_optimized(metadata_stream: Iterator[Dict[str, Any]],
     downloaded = 0
     failed = 0
     skipped = 0
+    redownloaded = 0
     
     try:
         with ThreadPoolExecutor(max_workers=cfg.workers) as executor:
             futures = []
-            max_outstanding = cfg.workers * 10  # Bounded queue
+            max_outstanding = cfg.workers * 10
             
             for row in metadata_stream:
                 # Check for stop signal
@@ -684,20 +899,26 @@ def process_downloads_optimized(metadata_stream: Iterator[Dict[str, Any]],
                 
                 image_id = row[cfg.id_col]
                 
-                # Skip if already completed
-                if progress_tracker.is_completed(image_id):
+                # Check if file exists and is tracked
+                file_exists, ext = sharding.file_exists(image_id)
+                is_completed = progress_tracker.is_completed(image_id)
+                
+                if file_exists and is_completed:
+                    # File exists and is tracked - skip
                     skipped += 1
                     continue
-                
-                # Check filesystem (O(1) with sharding)
-                if sharding.file_exists(image_id):
+                elif file_exists and not is_completed:
+                    # File exists but not tracked - add to tracker
                     progress_tracker.mark_completed(image_id)
                     skipped += 1
                     continue
+                elif not file_exists and is_completed:
+                    # This shouldn't happen after validation, but handle it
+                    log.debug(f"⚠️ ID {image_id} marked complete but file missing - redownloading")
+                    redownloaded += 1
                 
-                # Wait if too many futures outstanding
+                # Download needed
                 while len(futures) >= max_outstanding:
-                    # Process some completed futures
                     done_futures = []
                     for future in futures:
                         if future.done():
@@ -710,7 +931,6 @@ def process_downloads_optimized(metadata_stream: Iterator[Dict[str, Any]],
                             except:
                                 failed += 1
                     
-                    # Remove done futures
                     for f in done_futures:
                         futures.remove(f)
                     
@@ -726,9 +946,11 @@ def process_downloads_optimized(metadata_stream: Iterator[Dict[str, Any]],
                 futures.append(future)
                 
                 # Progress reporting
-                if (downloaded + failed + skipped) % 100 == 0:
+                total_processed = downloaded + failed + skipped
+                if total_processed % 100 == 0:
                     log.info(f"📥 Progress: {downloaded:,} downloaded, "
-                           f"{failed:,} failed, {skipped:,} skipped")
+                           f"{failed:,} failed, {skipped:,} skipped"
+                           + (f", {redownloaded:,} redownloaded" if redownloaded > 0 else ""))
             
             # Wait for remaining futures
             log.info("⏳ Waiting for remaining downloads to complete...")
@@ -746,8 +968,10 @@ def process_downloads_optimized(metadata_stream: Iterator[Dict[str, Any]],
         if json_writer:
             json_writer.close()
         progress_tracker.save_final()
+        
         log.info(f"✅ Complete: {downloaded:,} downloaded, "
-               f"{failed:,} failed, {skipped:,} skipped")
+               f"{failed:,} failed, {skipped:,} skipped"
+               + (f", {redownloaded:,} redownloaded" if redownloaded > 0 else ""))
 
 # ---------------------------------------------------------------------------
 # Authentication
@@ -804,12 +1028,11 @@ def main() -> None:
                 log.info(f"🎯 Dry run: {count:,} images match criteria")
                 return
             
-            # Process downloads with all optimizations
+            # Process downloads with validation
             if cfg.download_images:
-                process_downloads_optimized(metadata_stream, cfg, out_dir, stop_handler)
+                process_downloads_validated(metadata_stream, cfg, out_dir, stop_handler)
             elif cfg.save_filtered_metadata:
                 log.info("📝 Saving metadata only (download disabled)")
-                # Save metadata without downloading
                 json_writer = BatchedJSONWriter() if cfg.per_image_json else None
                 try:
                     for row in metadata_stream:
@@ -822,26 +1045,6 @@ def main() -> None:
                 finally:
                     if json_writer:
                         json_writer.close()
-        else:
-            # Fallback to legacy non-streaming mode
-            log.warning("⚠️  Using legacy non-streaming mode (not recommended for large datasets)")
-            from load_metadata_legacy import load_metadata, build_filter_mask, download_with_datapool
-            
-            df = load_metadata(meta_path, cfg)
-            log.info(f"Loaded {len(df):,} records.")
-            
-            mask = build_filter_mask(df, cfg)
-            df_sub = df[mask].reset_index(drop=True)
-            
-            match_count = len(df_sub)
-            log.info(f"✅ Found {match_count:,} records matching your criteria.")
-            
-            if cfg.dry_run:
-                log.info(f"Dry run: Would process {match_count:,} items.")
-                return
-            
-            if cfg.download_images:
-                download_with_datapool(df_sub, cfg, out_dir)
 
     log.info("🎉 Script completed successfully!")
 
