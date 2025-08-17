@@ -18,11 +18,11 @@ import threading
 import time
 import tarfile
 import mmap
-from collections import defaultdict
+from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional, Iterator, Dict, Any, Set, Tuple
+from typing import List, Optional, Iterator, Dict, Any, Set, Tuple, Callable
 from functools import lru_cache
 import io
 
@@ -173,14 +173,14 @@ class Config:
     workers: int = 24  # Increased for 32 threads
     io_workers: int = 12  # Dedicated I/O workers for RAID
     files_per_shard: int = 10000
-    batch_size: int = 1000  # Larger batches for streaming
-    tar_batch_size: int = 500  # Much larger for RAID
-    use_streaming: bool = True
+    batch_size: int = 2  # Larger batches for streaming
+    tar_batch_size: int = 5000  # Much larger for RAID
+    use_streaming: bool = False
     
     # New RAID optimizations
     prefetch_tars: int = 1  # Reduce to 1 to prevent duplicate loading
     max_memory_cache_gb: int = 100  # Increase to 100GB since you have 255GB
-    parallel_tar_extraction: bool = True  # Extract from multiple tars simultaneously
+    parallel_tar_extraction: bool = False  # Extract from multiple tars simultaneously
     write_buffer_size_mb: int = 256  # Large write buffers for RAID 0
     read_buffer_size_mb: int = 512  # Large read buffers for RAID 5
     use_memory_mapping: bool = False  # Disable to prevent double memory usage
@@ -201,7 +201,11 @@ class Config:
     # Basename collision handling in tar members:
     #   - "strict": require exact full path when collisions exist; otherwise skip
     #   - "prefer_top": prefer top-level entry if present; else shortest path
-    on_basename_collision: str = "strict"
+    on_basename_collision: str = "prefer_top"
+    # Session policy: disable further mmaps after N failures (NAS/RAID quirks)
+    mmap_disable_after_n: int = 3
+    # Bound memory usage of not-found sampling
+    not_found_max_sample: int = 5000
 
 # ---------------------------------------------------------------------------
 # Directory Sharding
@@ -215,16 +219,18 @@ class DirectorySharding:
         self.files_per_dir = files_per_dir
         self.base_dir.mkdir(parents=True, exist_ok=True)
     
-    def get_shard_path(self, image_id: int) -> Path:
-        """Get the shard directory path for a given image ID."""
+    def get_shard_path(self, image_id: int, create: bool = False) -> Path:
+        """Get the shard directory path for a given image ID.
+        If create=True, ensures the directory exists; otherwise does not mkdir."""
         shard_index = image_id // self.files_per_dir
         shard_name = f"shard_{shard_index:05d}"
         shard_path = self.base_dir / shard_name
-        try:
-            shard_path.mkdir(parents=True, exist_ok=True)
-        except OSError as e:
-            logging.error(f"Failed to create shard directory {shard_path}: {e}")
-            raise
+        if create:
+            try:
+                shard_path.mkdir(parents=True, exist_ok=True)
+            except OSError as e:
+                logging.error(f"Failed to create shard directory {shard_path}: {e}")
+                raise
         return shard_path
     
     def file_exists(self, image_id: int) -> Tuple[bool, Optional[str]]:
@@ -232,7 +238,9 @@ class DirectorySharding:
         Check if file exists in the specific shard directory.
         Returns (exists, extension) tuple.
         """
-        shard_path = self.get_shard_path(image_id)
+        # Do not create directories during validation/existence checks
+        shard_index = image_id // self.files_per_dir
+        shard_path = self.base_dir / f"shard_{shard_index:05d}"
         extensions = ['.jpg', '.jpeg', '.png', '.gif', '.webp']
         for ext in extensions:
             if (shard_path / f"{image_id}{ext}").exists():
@@ -463,7 +471,7 @@ class MemoryCacheManager:
     """Manages in-memory caching of tar files for fast access."""
     
     def __init__(self, max_size_gb: int = 20, read_buffer_size_mb: int = 256, use_memory_mapping: bool = False,
-                 large_tar_threshold_gb: int = 8, large_tars_policy: str = "mmap"):
+                 large_tar_threshold_gb: int = 8, large_tars_policy: str = "mmap", mmap_disable_after_n: int = 3):
         self.max_size_bytes = max_size_gb * 1024 * 1024 * 1024
         self.read_buffer_size_mb = read_buffer_size_mb
         self.cache: Dict[str, bytearray] = {}
@@ -480,12 +488,12 @@ class MemoryCacheManager:
         # Large tar handling
         self.large_tar_threshold_bytes = large_tar_threshold_gb * 1024 ** 3
         self.large_tar_policy = large_tars_policy
-        if large_tars_policy == "mmap":
-            self.use_memory_mapping = True or self.use_memory_mapping
         self._closed = False
         self.prefetch_threads_list = []
         self._start_prefetch_worker()
         self.in_flight_loads: Set[str] = set()
+        self.mmap_failures: int = 0
+        self.mmap_disable_after_n = max(1, int(mmap_disable_after_n))
 
     def _start_prefetch_worker(self):
         """Start background prefetch worker."""
@@ -522,6 +530,17 @@ class MemoryCacheManager:
         """Try to memory-map a tar file for zero-copy access."""
         if not self.use_memory_mapping:
              return None
+
+    def _record_mmap_failure(self, tar_name: str) -> None:
+        self.mmap_failures += 1
+        if self.mmap_failures >= self.mmap_disable_after_n:
+            # Disable session mmaps after repeated failures
+            self.use_memory_mapping = False
+            # For large tars, prefer skipping cache and direct reads henceforth
+            if self.large_tar_policy == "mmap":
+                self.large_tar_policy = "skip"
+            logging.warning(f"⚠️ Disabling memory mapping for session after {self.mmap_failures} failures; "
+                            f"falling back to direct reads for large tars.")
         try:
             fd = os.open(tar_path, os.O_RDONLY)
             try:
@@ -533,79 +552,96 @@ class MemoryCacheManager:
             if file_size < 10 * 1024**3:  # 10GB limit for mmap
                 mm = mmap.mmap(fd, file_size, access=mmap.ACCESS_READ)
                 os.close(fd)  # Close the file descriptor after creating mmap
-                logging.info(f"📍 Memory-mapped {tar_path.name} ({file_size / 1024**3:.1f}GB)")
                 return mm
             os.close(fd)
         except Exception as e:
             logging.debug(f"Could not memory-map {tar_path}: {e}")
         return None
     
+    
+    
     def _load_tar_to_cache(self, tar_path: Path) -> Optional[bytes]:
         """Load tar file into memory cache, honoring large-file policy and using chunked streaming."""
         tar_name = tar_path.name
-        
+        # Fast-path checks and wait-on-load
         with self.lock:
             if tar_name in self.cache:
                 self.access_times[tar_name] = time.time()
                 return self.cache[tar_name]
-            # Check if already being loaded
-            load_event = self.loading_tars.get(tar_name)
-
-        # If another thread is loading, wait with timeout
-        if load_event:
-            logging.debug(f"Tar {tar_name} already being loaded, waiting...")
-            if load_event.wait(timeout=300):
-                with self.lock:
-                    if tar_name in self.cache:
-                        self.access_times[tar_name] = time.time()
-                        return self.cache[tar_name]
-                    if tar_name in self.mmap_handles:
-                        self.access_times[tar_name] = time.time()
-                        return None
-            else:
-                logging.error(f"Timeout waiting for {tar_name} to load")
+            if tar_name in self.mmap_handles:
+                self.access_times[tar_name] = time.time()
                 return None
+            load_event = self.loading_tars.get(tar_name)
+        if load_event:
+            logging.debug(f"Tar {tar_name} already being prepared, waiting...")
+            if not load_event.wait(timeout=300):
+                logging.error(f"Timeout waiting for {tar_name} to prepare")
+                return None
+            with self.lock:
+                if tar_name in self.cache:
+                    self.access_times[tar_name] = time.time()
+                    return self.cache[tar_name]
+                if tar_name in self.mmap_handles:
+                    self.access_times[tar_name] = time.time()
+                    return None
+                return None
+        # Mark as loading (covers both mmap and full-cache paths)
+        with self.lock:
+            evt = threading.Event()
+            self.loading_tars[tar_name] = evt
+            self.in_flight_loads.add(tar_name)
 
         try:
             file_size = tar_path.stat().st_size
-            
+
             # Large tar handling policy
             if file_size >= self.large_tar_threshold_bytes:
-                if self.large_tar_policy == "mmap":
+                if self.large_tar_policy == "mmap" and self.use_memory_mapping:
                     mm = self._try_memory_map(tar_path)
                     if mm:
                         with self.lock:
-                            if tar_name not in self.mmap_handles:
-                                self.mmap_handles[tar_name] = mm
+                            self.mmap_handles[tar_name] = mm
                             self.access_times[tar_name] = time.time()
+                            event = self.loading_tars.pop(tar_name, None)
+                            if event:
+                                event.set()
+                            self.in_flight_loads.discard(tar_name)
                         logging.info(f"✅ Using mmap for large tar: {tar_name}")
                         return None
                     else:
                         logging.warning(f"⚠️ mmap requested but failed for {tar_name}. Falling back to direct reads.")
+                        self._record_mmap_failure(tar_name)
+                        with self.lock:
+                            event = self.loading_tars.pop(tar_name, None)
+                            if event:
+                                event.set()
+                            self.in_flight_loads.discard(tar_name)
                         return None
-                elif self.large_tar_policy == "skip" and not self.use_memory_mapping:
-                    logging.info(f"⏭️ Skipping full-cache of large tar ({file_size/1024**3:.1f}GB): {tar_name}")
+                elif self.large_tar_policy == "skip":
+                    logging.info(f"⭐️ Skipping full-cache of large tar ({file_size/1024**3:.1f}GB): {tar_name}")
+                    with self.lock:
+                        event = self.loading_tars.pop(tar_name, None)
+                        if event:
+                            event.set()
+                        self.in_flight_loads.discard(tar_name)
                     return None
                 # else: "full" -> proceed
 
             # Check capacity before loading
             if file_size > self.max_size_bytes:
                 logging.warning(f"Tar file {tar_name} too large for cache ({file_size / 1024**3:.1f}GB)")
+                with self.lock:
+                    event = self.loading_tars.pop(tar_name, None)
+                    if event:
+                        event.set()
+                    self.in_flight_loads.discard(tar_name)
                 return None
-            
-            # Mark as loading
-            with self.lock:
-                if tar_name in self.loading_tars:
-                    return None  # Another thread is loading
-                evt = threading.Event()
-                self.loading_tars[tar_name] = evt
-                self.in_flight_loads.add(tar_name)
-            
+
             # Evict until enough room
             with self.lock:
                 while self.total_size + file_size > self.max_size_bytes and self.cache:
                     self._evict_lru()
-            
+
             # Read the file in chunks to avoid transient RSS spikes
             buffer_size = min(self.read_buffer_size_mb * 1024 * 1024, 512 * 1024 * 1024)
             data_ba = bytearray()
@@ -617,7 +653,7 @@ class MemoryCacheManager:
                     data_ba.extend(chunk)
             # Keep as bytearray to avoid an extra copy; we will wrap with _BufferReader when opening
             data = data_ba
-            
+
             with self.lock:
                 self.cache[tar_name] = data
                 self.cache_sizes[tar_name] = file_size
@@ -625,21 +661,29 @@ class MemoryCacheManager:
                 self.total_size += file_size
                 event = self.loading_tars.pop(tar_name, None)
                 if event:
-                    event.set()  # Signal waiting threads
+                    event.set()
                 self.in_flight_loads.discard(tar_name)
 
             logging.info(f"✅ Cached {tar_name} (Cache: {self.total_size / 1024**3:.1f}/{self.max_size_bytes / 1024**3:.0f}GB)")
             return data
-            
+
         except Exception as e:
             logging.error(f"Failed to cache {tar_name}: {e}")
             with self.lock:
                 event = self.loading_tars.pop(tar_name, None)
                 if event:
-                    event.set()  # Signal error to waiting threads
+                    event.set()
                 self.in_flight_loads.discard(tar_name)
             return None
-    
+        finally:
+            # Ensure any waiters are released if we didn't already
+            with self.lock:
+                event = self.loading_tars.pop(tar_name, None)
+                if event:
+                    event.set()
+                self.in_flight_loads.discard(tar_name)
+
+
     def _evict_lru(self):
         """Evict least recently used entry."""
         if not self.cache:
@@ -788,7 +832,7 @@ class ParallelTarProcessor:
             'failed': 0,
             'skipped': 0,
             'not_found': 0,
-            'not_found_ids': [],  # Track individual IDs
+            'not_found_ids': deque(maxlen=cfg.not_found_max_sample),  # bounded sample
             'total_bytes_written': 0,
             'write_time': 0.0
         }
@@ -862,7 +906,7 @@ class ParallelTarProcessor:
         
         tar_name, filename = tar_info
         # Use image_id for output path
-        shard_path = self.sharding.get_shard_path(image_id)
+        shard_path = self.sharding.get_shard_path(image_id, create=False)
         ext_from_tar = os.path.splitext(filename)[1]  # Get extension from tar filename
         dest_path = shard_path / f"{image_id}{ext_from_tar}"
         
@@ -918,10 +962,13 @@ class ParallelTarProcessor:
             self._cleanup_completed_futures()
         
         with self.tar_lock:
-            batch = self.tar_batches.get(tar_name, [])
-            if not batch:
+            # take-and-replace to avoid losing appends racing with clear
+            existing = self.tar_batches.get(tar_name, [])
+            if not existing:
                 self.active_tars.discard(tar_name)
                 return
+            batch = existing
+            self.tar_batches[tar_name] = []  # new list for any concurrent producers
         
 
         tar_path = Path(self.cfg.source_images_dir) / tar_name
@@ -938,8 +985,6 @@ class ParallelTarProcessor:
             tar_path, batch
         )
         
-        # Clear batch to free memory
-        self.tar_batches[tar_name] = []
 
         # Track future
         with self.futures_lock:
@@ -984,16 +1029,26 @@ class ParallelTarProcessor:
                 logging.error(f"Failed to open {tar_path}")
                 return successful_ids
             
-            try:
-                # Build member index keyed by BASENAME -> list[TarInfo]
+            try:                # Build member indices:
+                #  - by BASENAME -> list[TarInfo] (for exact/known filename)
+                #  - by numeric ID prefix -> list[TarInfo] (for extension probing)
                 from collections import defaultdict as _dd
-                members_dict = _dd(list)
-                # Only index members by BASENAME we need (supports full-path inputs in batch)
-                needed_files = {fn.rsplit('/', 1)[-1] for _, fn, _, _ in batch}
+                members_by_base = _dd(list)
+                members_by_id = _dd(list)
+                needed_files = {fn.rsplit("/", 1)[-1] for _, fn, _, _ in batch}
+                needed_ids = {img_id for (img_id, _, _, _) in batch}
                 for member in tar.getmembers():
-                    base_name = member.name.rsplit('/', 1)[-1]
+                    base_name = member.name.rsplit("/", 1)[-1]
                     if base_name in needed_files:
-                        members_dict[base_name].append(member)
+                        members_by_base[base_name].append(member)
+                    # Probe by numeric ID prefix for fallback
+                    dot = base_name.find(".")
+                    if dot > 0:
+                        num = base_name[:dot]
+                        if num.isdigit():
+                            img_id = int(num)
+                            if img_id in needed_ids:
+                                members_by_id[img_id].append(member)
 
                 # Track what we successfully process
                 # Create a lock so concurrent extractfile() calls don't share state
@@ -1009,7 +1064,7 @@ class ParallelTarProcessor:
                     for chunk in chunks:
                         future = io_pool.submit(
                             self._extract_chunk,
-                            tar, members_dict, chunk, tar_io_lock
+                            tar, tar_path.name, members_by_base, members_by_id, chunk, tar_io_lock
                         )
                         futures.append(future)
                     
@@ -1033,19 +1088,21 @@ class ParallelTarProcessor:
         
         return successful_ids
     
-    def _extract_chunk(self, tar: tarfile.TarFile, members_dict: Dict[str, Any],
-                      chunk: List[Tuple[int, str, Path, Dict]], tar_io_lock: threading.Lock) -> List[int]:
+    
+    def _extract_chunk(self, tar: tarfile.TarFile, tar_name: str,
+                       members_by_base: Dict[str, Any], members_by_id: Dict[int, Any],
+                       chunk: List[Tuple[int, str, Path, Dict]], tar_io_lock: threading.Lock) -> List[int]:
         """Extract a chunk of files from tar.
         Access to tar is guarded by a lock because TarFile is not thread-safe.
         """
         successful_ids = []
-        buffer_size = min(self.cfg.write_buffer_size_mb, 64) * 1024 * 1024  # Cap buffer size
+        buffer_size = max(1, self.cfg.write_buffer_size_mb) * 1024 * 1024  # honor configured cap
         
         for image_id, filename, dest_path, row_data in chunk:
             try:
                 # Look up by BASENAME (dictionary is keyed by basename)
                 base = filename.rsplit('/', 1)[-1]
-                candidates = members_dict.get(base, [])
+                candidates = members_by_base.get(base, [])
                 member = None
                 # If caller provided a full path, prefer exact match among candidates
                 if '/' in filename and candidates:
@@ -1067,6 +1124,18 @@ class ParallelTarProcessor:
                         else:
                             logging.debug(f"Ambiguous basename {base}, skipping (provide full path).")
                             member = None
+                # Fallback: probe by numeric ID (handles extension mismatches)
+                if not member:
+                    id_candidates = members_by_id.get(image_id, [])
+                    if len(id_candidates) == 1:
+                        member = id_candidates[0]
+                    elif len(id_candidates) > 1:
+                        if self.cfg.on_basename_collision == "prefer_top":
+                            top = [c for c in id_candidates if '/' not in c.name]
+                            member = top[0] if len(top) == 1 else min(id_candidates, key=lambda c: c.name.count('/'))
+                        else:
+                            # deterministic but explicit: choose shortest path
+                            member = min(id_candidates, key=lambda c: c.name.count('/')) if id_candidates else None
                 
                 if not member:
                     logging.debug(f"Member {filename} not found in tar")
@@ -1082,47 +1151,47 @@ class ParallelTarProcessor:
                             file_obj.close()
                         
                         # Direct synchronous write with large buffer
+                        # Recompute destination extension from member in case of ID->ext probing
+                        ext_from_member = os.path.splitext(member.name)[1] or os.path.splitext(dest_path.name)[1]
+                        final_dir = dest_path.parent
+                        final_dir.mkdir(parents=True, exist_ok=True)
+                        final_path = final_dir / f"{image_id}{ext_from_member}"
+                        temp_path = final_path.with_suffix(final_path.suffix + '.tmp')
+                        with open(temp_path, 'wb', buffering=buffer_size) as f:
+                            f.write(data)
+                            # Only fsync if explicitly enabled (usually disabled for speed)
+                            if self.cfg.enable_fsync:
+                                f.flush()
+                                os.fsync(f.fileno())
+                        temp_path.replace(final_path)
+                        # Track write statistics
+                        with self.stats_lock:
+                            self.stats['total_bytes_written'] += len(data)
+                            self.stats['write_time'] += (time.time() - start_write)
+
+                    # Write JSON if needed
+                    if self.cfg.per_image_json and self.json_writer:
+                        json_path = final_dir / f"{image_id}.json"
+                        json_data = prepare_json_data(row_data, self.cfg)
+                        self.json_writer.add_write(json_path, json_data)
+                        # Cache discovered internal path for future lookups
                         try:
-                            temp_path = dest_path.with_suffix('.tmp')
-                            with open(temp_path, 'wb', buffering=buffer_size) as f:
-                                f.write(data)
-                                # Only fsync if explicitly enabled (usually disabled for speed)
-                                if self.cfg.enable_fsync:
-                                    f.flush()
-                                    os.fsync(f.fileno())
-                            temp_path.replace(dest_path)
-                            # Track write statistics
-                            with self.stats_lock:
-                                self.stats['total_bytes_written'] += len(data)
-                                self.stats['write_time'] += (time.time() - start_write)
+                            if hasattr(self.tar_index, "cache_discovered_path"):
+                                self.tar_index.cache_discovered_path(image_id, tar_name, member.name)
+                        except Exception:
+                            pass
 
-                        except Exception as e:
-                            logging.error(f"Failed to write {dest_path}: {e}")
-                            if temp_path.exists():
-                                temp_path.unlink()
-                            continue
-                        
-                        # Write JSON if needed
-                        if self.cfg.per_image_json and self.json_writer:
-                            json_path = dest_path.parent / f"{image_id}.json"
-                            json_data = prepare_json_data(row_data, self.cfg)
-                            self.json_writer.add_write(json_path, json_data)
+                    # Only mark successful AFTER write completes
+                    self.progress_tracker.mark_completed(image_id)                       
+                    successful_ids.append(image_id)
 
-                        # Only mark successful AFTER write completes
-                        self.progress_tracker.mark_completed(image_id)                       
-                        successful_ids.append(image_id)
-
-                    
                 except Exception as e:
                     logging.debug(f"Direct extraction failed for {filename}: {e}")
-
-                    
             except Exception as e:
-                logging.debug(f"Failed to extract {filename}: {e}")
-        
+                logging.error(f"Unexpected error during extraction of {filename}: {e}")
+
         return successful_ids
 
-    
     def finish_remaining(self):
         """Process all remaining batches."""
         logging.info(f"⏳ Processing {len(self.tar_batches)} remaining tar batches...")
@@ -1235,6 +1304,7 @@ class SoftStopHandler:
         self.stop_event = threading.Event()
         self.original_sigint = None
         self._signal_count = 0
+        self._flush_hooks: List[Callable[[], None]] = []
         
     def __enter__(self):
         self.original_sigint = signal.signal(signal.SIGINT, self._signal_handler)
@@ -1242,6 +1312,10 @@ class SoftStopHandler:
         
     def __exit__(self, exc_type, exc_val, exc_tb):
         signal.signal(signal.SIGINT, self.original_sigint)
+        
+    def add_flush_hook(self, fn: Callable[[], None]) -> None:
+        """Register a hook to flush/flush+fsync before hard-exit."""
+        self._flush_hooks.append(fn)
         
     def _signal_handler(self, signum, frame):
         self._signal_count += 1
@@ -1251,8 +1325,17 @@ class SoftStopHandler:
             logging.warning("Press Ctrl+C again to force exit.")
             self.stop_event.set()
         else:
-            logging.warning("\n⚠️ Force exit requested.")
-            os._exit(1)
+            logging.warning("\n⚠️ Force exit requested. Attempting quick durability flush...")
+            # Best-effort short flush of pending writes/progress
+            try:
+                for fn in self._flush_hooks:
+                    try:
+                        fn()
+                    except Exception:
+                        pass
+                time.sleep(0.5)
+            finally:
+                os._exit(1)
     
     def should_stop(self):
         return self.stop_event.is_set()
@@ -1325,13 +1408,18 @@ def process_extractions_optimized(metadata_stream: Iterator[Dict[str, Any]],
     # Create parallel processor
     processor = ParallelTarProcessor(cfg, tar_index, sharding, progress_tracker, json_writer)
     progress_reporter = ProgressReporter(interval=10.0)
+    # Register durability flush hooks for hard-exit
+    if stop_handler:
+        if json_writer:
+            stop_handler.add_flush_hook(lambda: json_writer.close())
+        stop_handler.add_flush_hook(lambda: progress_tracker.save_final())
     
     # Show starting stats
     stats = progress_tracker.get_statistics()
     logging.info(f"📊 Starting with {stats['completed']:,} completed, {stats['missing']:,} missing")
     logging.info(f"🚀 Using {cfg.workers} extraction workers, {cfg.io_workers} I/O workers")
     logging.info(f"💾 Memory cache: up to {cfg.max_memory_cache_gb}GB")
-    logging.info(f"📀 RAID optimized: {cfg.read_buffer_size_mb}MB read, {cfg.write_buffer_size_mb}MB write buffers")
+    logging.info(f"💽 RAID optimized: {cfg.read_buffer_size_mb}MB read, {cfg.write_buffer_size_mb}MB write buffers")
     
     try:
         # Process metadata stream
@@ -1362,7 +1450,17 @@ def process_extractions_optimized(metadata_stream: Iterator[Dict[str, Any]],
         # Final report
         final_stats = processor.get_stats()
         progress_reporter.report(final_stats, force=True)
-        
+        # Persist a snapshot of sampled not-found IDs
+        try:
+            not_found_sample = list(final_stats.get('not_found_ids', []))
+            if not_found_sample:
+                with open(dest_dir / "not_found_ids.sample.json", "w", encoding="utf-8") as f:
+                    json.dump({"count": final_stats.get('not_found', 0),
+                               "sample_size": len(not_found_sample),
+                               "ids": not_found_sample}, f, indent=2)
+        except Exception as e:
+            logging.warning(f"⚠️ Failed to persist not-found sample: {e}")
+
         logging.info(
             f"✅ Extraction complete: {final_stats['extracted']:,} extracted, "
             f"{final_stats['failed']:,} failed, {final_stats['skipped']:,} skipped, "
@@ -1555,7 +1653,7 @@ def stream_filtered_metadata(path: Path, cfg: Config, stop_handler: Optional[Sof
         ])
     
     # Get available columns
-    available_cols = lf.columns
+    available_cols = set(lf.schema.keys())
     final_cols = list(cols_to_load.intersection(available_cols))
     
     if final_cols:
@@ -1607,13 +1705,17 @@ def stream_filtered_metadata(path: Path, cfg: Config, stop_handler: Optional[Sof
     lf = lf.filter(filter_expr)
     
     try:
-        logging.info(f"🔄 Starting streaming collection with batch size {cfg.batch_size}")
+        logging.info(f"🔥 Starting streaming collection with batch size {cfg.batch_size}")
         
         # Stream in batches for constant memory usage
         batch_count = 0
         total_yielded = 0
         
-        for batch_df in lf.collect(streaming=True).iter_slices(cfg.batch_size):
+        try:
+            collected = lf.collect(engine="streaming")  # new API
+        except TypeError:
+            collected = lf.collect(streaming=True)      # fallback for older Polars
+        for batch_df in collected.iter_slices(cfg.batch_size):
             batch_count += 1
             if batch_count % 10 == 0:
                 logging.info(f"📊 Processing batch {batch_count} ({total_yielded:,} items so far)...")
@@ -1957,6 +2059,12 @@ class TarIndex:
         filename = internal_path if internal_path else f"{image_id}{ext}"
         return (tar_name, filename)
 
+    def cache_discovered_path(self, image_id: int, tar_name: str, internal_path: str) -> None:
+        """Cache a discovered full internal path for future lookups."""
+        with self.lock:
+            self.index[image_id] = tar_name
+            self.index_paths[image_id] = internal_path
+
 
     def get_statistics(self) -> Dict[str, Any]:
         """Get index statistics for debugging."""
@@ -2046,7 +2154,7 @@ def main() -> None:
         if cfg.extract_images:
             process_extractions_optimized(metadata_stream, cfg, out_dir, tar_index, stop_handler)
         else:
-            logging.info("📝 Filtering metadata only (extraction disabled)")
+            logging.info("📄 Filtering metadata only (extraction disabled)")
             count = sum(1 for _ in metadata_stream)
             logging.info(f"✅ Found {count:,} images matching criteria")
     
