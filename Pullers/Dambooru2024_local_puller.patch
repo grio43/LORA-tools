@@ -1,0 +1,266 @@
+diff --git a/Dambooru2024_local_puller.py b/Dambooru2024_local_puller.py
+index 8a0c0aa..c7a43b5 100644
+--- a/Dambooru2024_local_puller.py
++++ b/Dambooru2024_local_puller.py
+@@ -226,10 +226,11 @@ class MemoryCacheManager:
+     """Manages in-memory caching of tar files for fast access."""
+     
+-    def __init__(self, max_size_gb: int = 20, read_buffer_size_mb: int = 256, use_memory_mapping: bool = False,
+-                 large_tar_threshold_gb: int = 8, large_tars_policy: str = "mmap", mmap_disable_after_n: int = 3):
++    def __init__(self, max_size_gb: int = 20, read_buffer_size_mb: int = 256, use_memory_mapping: bool = False,
++                 large_tar_threshold_gb: int = 8, large_tars_policy: str = "mmap", mmap_disable_after_n: int = 3,
++                 prefetch_threads: int = 2):
+         self.max_size_bytes = max_size_gb * 1024 * 1024 * 1024
+         self.read_buffer_size_mb = read_buffer_size_mb
+         self.cache: Dict[str, bytearray] = {}
+@@ -241,7 +242,7 @@ class MemoryCacheManager:
+         self.loading_tars: Dict[str, threading.Event] = {}  # Track tars being loaded with events
+         self.prefetch_queue = []  # Simple list instead of Queue
+         self.prefetch_lock = threading.Lock()
+-        self.prefetch_threads = 2
++        self.prefetch_threads = max(1, int(prefetch_threads))
+         self.mmap_handles: Dict[str, mmap.mmap] = {}  # Memory mapped files
+         self.use_memory_mapping = use_memory_mapping
+         # Large tar handling
+@@ -274,17 +275,30 @@ class MemoryCacheManager:
+             thread.start()
+             self.prefetch_threads_list.append(thread)
+ 
+     def _try_memory_map(self, tar_path: Path) -> Optional[mmap.mmap]:
+         """Try to memory-map a tar file for zero-copy access."""
+-        if not self.use_memory_mapping:
+-             return None
++        if not self.use_memory_mapping:
++            return None
++        try:
++            fd = os.open(tar_path, os.O_RDONLY)
++            try:
++                # Ensure file is accessible; a stat also helps surface odd FS errors early
++                os.fstat(fd)
++            except Exception:
++                os.close(fd)
++                raise
++            # Map the entire file read-only; length=0 maps whole file
++            mm = mmap.mmap(fd, length=0, access=mmap.ACCESS_READ)
++            os.close(fd)  # descriptor can be closed after mapping
++            return mm
++        except Exception as e:
++            logging.debug(f"mmap open failed for {tar_path}: {e}")
++            return None
+ 
+-    def _record_mmap_failure(self, tar_name: str) -> None:
+-        self.mmap_failures += 1
++    def _record_mmap_failure(self, tar_path: Optional[Path] = None) -> None:
++        """Record a failed mmap attempt and (optionally) adjust session policy. Side-effect only."""
++        self.mmap_failures += 1
++        if tar_path:
++            logging.debug(f"Recording mmap failure for {tar_path}")
+         if self.mmap_failures >= self.mmap_disable_after_n:
+             # Disable session mmaps after repeated failures
+             self.use_memory_mapping = False
+             # For large tars, prefer skipping cache and direct reads henceforth
+             if self.large_tar_policy == "mmap":
+                 self.large_tar_policy = "skip"
+             logging.warning(f"⚠️ Disabling memory mapping for session after {self.mmap_failures} failures; "
+                             f"falling back to direct reads for large tars.")
+-        try:
+-            fd = os.open(tar_path, os.O_RDONLY)
+-            try:
+-                file_size = os.fstat(fd).st_size
+-            except:
+-                os.close(fd)
+-                raise
+-            # Only mmap files that fit in reasonable memory
+-            if file_size < 10 * 1024**3:  # 10GB limit for mmap
+-                mm = mmap.mmap(fd, file_size, access=mmap.ACCESS_READ)
+-                os.close(fd)  # Close the file descriptor after creating mmap
+-                return mm
+-            os.close(fd)
+-        except Exception as e:
+-            logging.debug(f"Could not memory-map {tar_path}: {e}")
+-        return None
+     
+     
+     
+     def _load_tar_to_cache(self, tar_path: Path) -> Optional[bytes]:
+         """Load tar file into memory cache, honoring large-file policy and using chunked streaming."""
+@@ -320,34 +334,24 @@ class MemoryCacheManager:
+             # Large tar handling policy
+             if file_size >= self.large_tar_threshold_bytes:
+                 if self.large_tar_policy == "mmap" and self.use_memory_mapping:
+                     mm = self._try_memory_map(tar_path)
+                     if mm:
+                         with self.lock:
+                             self.mmap_handles[tar_name] = mm
+                             self.access_times[tar_name] = time.time()
+-                            event = self.loading_tars.pop(tar_name, None)
+-                            if event:
+-                                event.set()
+-                            self.in_flight_loads.discard(tar_name)
+                         logging.info(f"✅ Using mmap for large tar: {tar_name}")
+                         return None
+                     else:
+                         logging.warning(f"⚠️ mmap requested but failed for {tar_name}. Falling back to direct reads.")
+-                        self._record_mmap_failure(tar_name)
+-                        with self.lock:
+-                            event = self.loading_tars.pop(tar_name, None)
+-                            if event:
+-                                event.set()
+-                            self.in_flight_loads.discard(tar_name)
++                        self._record_mmap_failure(tar_path)
+                         return None
+                 elif self.large_tar_policy == "skip":
+                     logging.info(f"⭐️ Skipping full-cache of large tar ({file_size/1024**3:.1f}GB): {tar_name}")
+-                    with self.lock:
+-                        event = self.loading_tars.pop(tar_name, None)
+-                        if event:
+-                            event.set()
+-                        self.in_flight_loads.discard(tar_name)
+                     return None
+                 # else: "full" -> proceed
+ 
+             # Check capacity before loading
+             if file_size > self.max_size_bytes:
+                 logging.warning(f"Tar file {tar_name} too large for cache ({file_size / 1024**3:.1f}GB)")
+-                with self.lock:
+-                    event = self.loading_tars.pop(tar_name, None)
+-                    if event:
+-                        event.set()
+-                    self.in_flight_loads.discard(tar_name)
+                 return None
+ 
+             # Evict until enough room
+@@ -372,22 +376,12 @@ class MemoryCacheManager:
+             # Keep as bytearray to avoid an extra copy; we will wrap with _BufferReader when opening
+             data = data_ba
+ 
+             with self.lock:
+                 self.cache[tar_name] = data
+                 self.cache_sizes[tar_name] = file_size
+                 self.access_times[tar_name] = time.time()
+                 self.total_size += file_size
+-                event = self.loading_tars.pop(tar_name, None)
+-                if event:
+-                    event.set()
+-                self.in_flight_loads.discard(tar_name)
+ 
+             logging.info(f"✅ Cached {tar_name} (Cache: {self.total_size / 1024**3:.1f}/{self.max_size_bytes / 1024**3:.0f}GB)")
+             return data
+ 
+         except Exception as e:
+             logging.error(f"Failed to cache {tar_name}: {e}")
+-            with self.lock:
+-                event = self.loading_tars.pop(tar_name, None)
+-                if event:
+-                    event.set()
+-                self.in_flight_loads.discard(tar_name)
+             return None
+         finally:
+             # Ensure any waiters are released if we didn't already
+             with self.lock:
+                 event = self.loading_tars.pop(tar_name, None)
+                 if event:
+@@ -503,9 +497,9 @@ class ParallelTarProcessor:
+         self.json_writer = json_writer
+         self.cache_manager = MemoryCacheManager(
+             cfg.max_memory_cache_gb, cfg.read_buffer_size_mb, cfg.use_memory_mapping,
+-            cfg.large_tar_threshold_gb, cfg.large_tars_policy
++            cfg.large_tar_threshold_gb, cfg.large_tars_policy, prefetch_threads=cfg.prefetch_tars
+         )
+         self.memory_monitor = MemoryMonitor(cfg.memory_high_water_gb, cfg.memory_low_water_gb)
+ 
+@@ -679,7 +673,7 @@ class ParallelTarProcessor:
+                 needed_files = {fn.rsplit("/", 1)[-1] for _, fn, _, _ in batch}
+                 needed_ids = {img_id for (img_id, _, _, _) in batch}
+-                for member in tar.getmembers():
++                for member in tar:
+                     base_name = member.name.rsplit("/", 1)[-1]
+                     if base_name in needed_files:
+                         members_by_base[base_name].append(member)
+@@ -873,10 +867,7 @@ class ProgressReporter:
+         with self.lock:
+             elapsed = time.time() - self.start_time
+-            total = sum(v for v in stats.values() if isinstance(v, (int, float)))
+-            
+             # Calculate rates
+             if self.last_stats and elapsed > 0:
+                 time_delta = time.time() - self.last_report
+                 extracted_delta = stats['extracted'] - self.last_stats.get('extracted', 0)
+                 rate = extracted_delta / time_delta if time_delta > 0 else 0
+@@ -1110,17 +1101,17 @@ def build_cli() -> argparse.ArgumentParser:
+         prog="danbooru-local-puller",
+         description="Filter and extract Danbooru images from local tar archives with RAID optimizations.",
+         formatter_class=argparse.RawTextHelpFormatter,
+         epilog=textwrap.dedent("""
+             Example Usage:
+             --------------
+             # Use default filters (from Config class)
+-            python danbooru2024_local_puller.py
++            %(prog)s
+ 
+             # Custom tag filtering
+-            python danbooru2024_local_puller.py --include "1girl solo" --exclude "lowres"
++            %(prog)s --include "1girl solo" --exclude "lowres"
+ 
+             # Filter by score and rating
+-            python danbooru2024_local_puller.py --min-score 50 --ratings safe general
++            %(prog)s --min-score 50 --ratings safe general
+ 
+             # Character and copyright filtering
+-            python danbooru2024_local_puller.py --include-characters "hakurei_reimu" --include-copyrights "touhou"
++            %(prog)s --include-characters "hakurei_reimu" --include-copyrights "touhou"
+             """),
+     )
+@@ -1256,6 +1247,15 @@ def stream_filtered_metadata(path: Path, cfg: Config, stop_handler: Optional[Sof
+     if final_cols:
+         lf = lf.select(final_cols)
+     
+     # Apply transformations while still lazy
+     numeric_cols = [c for c in (cfg.width_col, cfg.height_col, cfg.score_col) if c in final_cols]
+     for col in numeric_cols:
+@@ -1268,6 +1268,12 @@ def stream_filtered_metadata(path: Path, cfg: Config, stop_handler: Optional[Sof
+               .fill_null(-1 if col == cfg.score_col else 0)  # Use -1 for score to distinguish from actual 0
+         )
++    # Normalize rating column early so downstream .str ops never hit non-strings (E007)
++    if cfg.rating_col in final_cols:
++        lf = lf.with_columns(
++            pl.col(cfg.rating_col)
++              .cast(pl.String)
++              .fill_null("")
++              .str.to_lowercase()
++        )
+     
+     # Normalize tag columns - MUST normalize all columns used for filtering
+     tag_cols_to_normalize = []
+@@ -1324,18 +1330,22 @@ def build_polars_filter_expr(cfg: Config) -> pl.Expr:
+     if cfg.enable_score_filtering and cfg.min_score is not None:
+         filters.append(pl.col(cfg.score_col) >= cfg.min_score)
+     
+     # Rating filtering
+     if cfg.enable_rating_filtering and cfg.ratings:
+-        rating_filters = []
++        rating_filters = []
++        # Work on a normalized, string-typed view to avoid runtime errors (E007)
++        rate_col = (
++            pl.col(cfg.rating_col)
++              .cast(pl.String)
++              .str.to_lowercase()
++        )
+         for rating in cfg.ratings:
+             rating_lower = rating.lower()
+             if rating_lower in ["safe", "s"]:
+-                rating_filters.append(pl.col(cfg.rating_col).str.to_lowercase().is_in(["safe", "s"]))
++                rating_filters.append(rate_col.is_in(["safe", "s"]))
+             elif rating_lower in ["general", "g"]:
+-                rating_filters.append(pl.col(cfg.rating_col).str.to_lowercase().is_in(["general", "g"]))
++                rating_filters.append(rate_col.is_in(["general", "g"]))
+             elif rating_lower in ["questionable", "q"]:
+-                rating_filters.append(pl.col(cfg.rating_col).str.to_lowercase().is_in(["questionable", "q"]))
++                rating_filters.append(rate_col.is_in(["questionable", "q"]))
+             elif rating_lower in ["explicit", "e"]:
+-                rating_filters.append(pl.col(cfg.rating_col).str.to_lowercase().is_in(["explicit", "e"]))
++                rating_filters.append(rate_col.is_in(["explicit", "e"]))
+         if rating_filters:
+             filters.append(pl.any_horizontal(rating_filters))
+ 
+ 
