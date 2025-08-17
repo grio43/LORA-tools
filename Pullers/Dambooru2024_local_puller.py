@@ -19,6 +19,7 @@ import time
 import tarfile
 import mmap
 from collections import defaultdict, deque
+import queue
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -170,36 +171,68 @@ class Config:
     rebuild_tar_index: bool = False
 
     # ---- RAID-Optimized Performance ---------------------------------------
-    workers: int = 24  # Increased for 32 threads
-    io_workers: int = 12  # Dedicated I/O workers for RAID
+    # Tune the core thread and batch parameters.  The default number of workers
+    # is left high to fully utilize modern multi‑core systems, but the
+    # I/O workers are reduced to avoid oversaturating the destination RAID.
+    workers: int = 24  # CPU‑bound extraction workers
+    io_workers: int = 8  # I/O‑bound JSON and file writers
     files_per_shard: int = 10000
-    batch_size: int = 1000 # Larger batches for streaming
-    tar_batch_size: int = 5000  # Much larger for RAID
+    batch_size: int = 1000  # Number of metadata rows to read at once
+    # Reduce the tar batch size drastically so that even sparse datasets
+    # trigger extraction quickly.  Large thresholds can starve the system
+    # when only a handful of images reside in each tar.
+    tar_batch_size: int = 100
     use_streaming: bool = False
-    
+
     # New RAID optimizations
-    # Tune prefetching and buffer sizes based on RAID characteristics.
-    # With a RAID 5 source we prefer slightly more prefetching to hide parity
-    # read latency, so default to two concurrent prefetch threads.  Writes are
-    # bound by the RAID 0 destination’s throughput, so use a larger write buffer.
-    prefetch_tars: int = 2
-    max_memory_cache_gb: int = 100  # Total RAM allocated for caching tars
+    # Prefetching is disabled by default to avoid filling memory before
+    # extraction has a chance to keep up.  Once the system is tuned, this
+    # value can be raised to overlap I/O with CPU, but zero is safest.
+    prefetch_tars: int = 0
+    # Keep the cache small to bound RAM usage.  The cache manager will
+    # evict least‑recently used tars when the size grows beyond this limit.
+    max_memory_cache_gb: int = 20  # Total RAM allocated for caching tars
     parallel_tar_extraction: bool = False  # Extract from multiple tars simultaneously
     # The write buffer size controls how much data Python buffers in memory
-    # when writing each image file to disk.  Extremely large buffers (hundreds
-    # of megabytes) can lead to substantial memory overhead because each
-    # concurrent writer allocates its own buffer.  In practice there is
-    # little benefit to buffers larger than a few tens of megabytes – the
-    # underlying filesystem will coalesce writes efficiently.  Reduce the
-    # default from 512MB to a more reasonable 32MB to avoid excessive
-    # memory consumption and improve overall throughput.
-    write_buffer_size_mb: int = 32  # Reasonable write buffer for high‑throughput RAID 0
+    # when writing each image file to disk.  Extremely large buffers can
+    # consume excessive memory and provide no benefit; use a modest value.
+    write_buffer_size_mb: int = 8  # Reasonable write buffer for high‑throughput RAID 0
     read_buffer_size_mb: int = 1024  # Larger read buffer for RAID 5 sequential reads
     use_memory_mapping: bool = False  # Disable to prevent double memory usage
-    concurrent_tar_limit: int = 2  # Limit concurrent tars to avoid disk contention
+    # Increase concurrent tar processing to keep more tars active when batch
+    # sizes are small.  A higher limit combined with small batches reduces
+    # waiting and improves throughput.
+    concurrent_tar_limit: int = 4
+    # Adjust memory watermarks to pause ingestion before RAM fills up.  The
+    # system will resume when memory usage drops sufficiently.  These values
+    # are left unchanged but exposed here for clarity.
     memory_high_water_gb: int = 100  # Pause processing above this memory usage
     memory_low_water_gb: int = 40  # Resume processing below this memory usage
-    max_pending_batches: int = 5  # Maximum tar batches to keep in memory
+
+    # ----- New configuration options -----
+    # How often (in number of completed images) to update the progress file.
+    # Larger values reduce progress‑file writes and fsyncs, improving throughput on
+    # high‑performance storage.  See documentation on fsync overhead【746901474728539†L74-L85】.
+    # How often (in number of completed images) to update the progress file.
+    # A larger value reduces progress‑file writes and fsyncs.  When extracting
+    # millions of images, updates every few thousand items strike a good
+    # balance between observability and I/O overhead.
+    progress_update_interval: int = 5000
+
+    # Number of worker threads for the asynchronous JSON writer.  A value of zero
+    # disables the async writer and falls back to BatchedJSONWriter.
+    json_writer_workers: int = 4
+
+    # If true, create shard directories up‑front (or when enqueuing) rather than
+    # during file extraction.  This avoids repeated mkdir() calls and reduces
+    # metadata I/O on the destination filesystem.
+    # Create shard directories up front rather than during extraction.  This
+    # avoids repeated mkdir() calls under high concurrency and speeds up
+    # subsequent file writes.
+    pre_create_shards: bool = True
+    # Increase the number of pending batches allowed in memory.  A small
+    # value combined with small tar batches can lead to excessive pausing.
+    max_pending_batches: int = 10  # Maximum tar batches to keep in memory
     enable_fsync: bool = False  # Disable fsync for speed (filesystem will handle it)
     # ---- Large TAR handling policy -----------------------------------
     # How to handle tar files >= large_tar_threshold_gb
@@ -364,6 +397,103 @@ class BatchedJSONWriter:
                                 self._atomic_write_json(path, data)
                             except Exception as e:
                                 logging.error(f"❌ Failed to force flush {path}: {e}")
+
+# ---------------------------------------------------------------------------
+# Asynchronous JSON Writer
+# ---------------------------------------------------------------------------
+class AsyncJSONWriter:
+    """Threaded JSON writer using a queue for thread-safe writes.
+
+    This writer spawns a fixed number of worker threads which
+    continuously pull JSON write tasks off of an internal queue.  Each
+    task consists of a destination path and the JSON-serializable data
+    to write.  Because each metadata file is independent, writes are
+    performed directly to the final path without an intermediate
+    temporary file or atomic rename.  Synchronization across threads is
+    handled by the ``queue.Queue`` implementation, which uses internal
+    locking to coordinate producers and consumers【818633937408990†L59-L72】.  The caller is
+    responsible for ensuring that no two tasks target the same
+    destination file simultaneously; within this application each
+    ``image_id`` uniquely identifies an output JSON so no races occur.
+
+    The writer honours the ``enable_fsync`` flag from the configuration.
+    When enabled it will flush and fsync after writing each file; when
+    disabled the filesystem is trusted to perform its own write-back
+    caching, which can improve throughput on high‑performance storage
+    devices【746901474728539†L74-L85】.
+    """
+
+    def __init__(self, workers: int = 4, enable_fsync: bool = False):
+        self.queue: queue.Queue[Optional[Tuple[Path, Dict[str, Any]]]] = queue.Queue()
+        self.workers = max(1, int(workers))
+        self.enable_fsync = enable_fsync
+        self._threads: List[threading.Thread] = []
+        self._closed = False
+
+        # Start worker threads
+        for i in range(self.workers):
+            t = threading.Thread(target=self._worker, name=f"json_writer_{i}", daemon=True)
+            t.start()
+            self._threads.append(t)
+
+    def add_write(self, path: Path, data: Dict[str, Any]):
+        """Enqueue a JSON write operation.
+
+        Parameters
+        ----------
+        path : Path
+            The final destination path for the JSON file.  The file
+            will be overwritten if it already exists.
+        data : Dict[str, Any]
+            A JSON-serializable dictionary to write to the file.
+        """
+        if self._closed:
+            # Ignore writes after closure
+            return
+        self.queue.put((path, data))
+
+    def _worker(self):
+        """Worker thread loop that processes queued JSON writes."""
+        while True:
+            task = self.queue.get()
+            if task is None:
+                # Sentinel received: exit thread
+                self.queue.task_done()
+                break
+            path, data = task
+            try:
+                # Ensure parent directory exists; this should already be
+                # created by the sharding mechanism but perform a
+                # best-effort creation in case of missing directories.
+                try:
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                except Exception:
+                    pass
+                # Write directly to the target path
+                with open(path, 'w', encoding='utf-8') as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+                    f.flush()
+                    if self.enable_fsync:
+                        os.fsync(f.fileno())
+            except Exception as e:
+                logging.error(f"❌ AsyncJSONWriter failed to write {path}: {e}")
+            finally:
+                self.queue.task_done()
+
+    def close(self):
+        """Signal all worker threads to stop and wait for them to finish."""
+        if self._closed:
+            return
+        self._closed = True
+        # Wait until all pending tasks have been processed
+        self.queue.join()
+        # Send sentinel tasks to stop workers
+        for _ in range(self.workers):
+            self.queue.put(None)
+        # Ensure sentinel tasks are processed
+        self.queue.join()
+        for t in self._threads:
+            t.join(timeout=5)
 
 # ---------------------------------------------------------------------------
 # Validating Progress Tracker
@@ -896,6 +1026,19 @@ class ParallelTarProcessor:
         # Use the id column as the primary identifier - it matches the actual image
         image_id = row[self.cfg.id_col]  # This is the actual image ID that matches tar files
         file_url = row.get(self.cfg.file_path_col, "")
+
+        # Optionally create the shard directory ahead of time.  This avoids
+        # repeated mkdir() calls during extraction.  The DirectorySharding
+        # class will silently ignore existing directories when
+        # create=True.  This call is intentionally placed before any
+        # file existence checks to ensure the directory exists for
+        # subsequent writes when pre_create_shards is enabled.
+        if self.cfg.pre_create_shards:
+            try:
+                self.sharding.get_shard_path(image_id, create=True)
+            except Exception:
+                # Log but continue; directory creation failures will be handled later
+                logging.error(f"Failed to pre-create shard for {image_id}")
         
         # Check memory and actually pause if needed
         is_paused, mem_gb = self.memory_monitor.check_memory()
@@ -933,38 +1076,81 @@ class ParallelTarProcessor:
         ext_from_tar = os.path.splitext(filename)[1]  # Get extension from tar filename
         dest_path = shard_path / f"{image_id}{ext_from_tar}"
         
-        # Add to batch
-        should_submit = []
+        # Add to batch and decide whether to trigger extraction
+        should_submit: List[str] = []
         with self.tar_lock:
-            # Now using image_id consistently
+            # Queue this item for extraction from its tar.  The tuple holds
+            # the image identifier, the filename inside the tar, the
+            # destination path, and the full row for metadata.
             self.tar_batches[tar_name].append((image_id, filename, dest_path, row))
 
-
+            # Count total pending items across all tar batches.  When this
+            # number grows large relative to the batch size, we proactively
+            # flush some batches to avoid building up huge in‑memory queues.
             total_pending = sum(len(batch) for batch in self.tar_batches.values())
 
             if total_pending > self.cfg.max_pending_batches * self.cfg.tar_batch_size:
                 logging.debug(f"📦 {total_pending} items pending extraction")
 
-            # Process if batch is large enough
-            # Reduced concurrent tar processing to avoid write contention
+            # -----------------------------------------------------------------
+            # Batch submission policy
+            #
+            # The original logic only submitted a tar for extraction when its
+            # batch reached the full ``tar_batch_size``.  For sparse
+            # datasets this could take a very long time, resulting in large
+            # numbers of cached tars but little work being done.  Here we
+            # introduce two additional triggers:
+            #   1. A low per‑tar threshold (hard coded at 50) to ensure that
+            #      small batches are flushed promptly.  This value can be
+            #      tuned but should remain far below the default
+            #      ``tar_batch_size``.
+            #   2. A global pending limit (200 items) that forces the
+            #      largest batches to submit when the overall queue gets big.
+
+            # Always submit when the primary batch threshold is reached.
             if len(self.tar_batches[tar_name]) >= self.cfg.tar_batch_size:
                 should_submit.append(tar_name)
-            # Process smaller batches too to avoid starvation
-            elif len(self.active_tars) < self.cfg.concurrent_tar_limit:
-                # Sort by batch size and submit multiple if we have capacity
-                sorted_batches = sorted(
-                    [(name, len(batch)) for name, batch in self.tar_batches.items() if batch],
-                    key=lambda x: x[1], reverse=True
-                )
-                for tar_name, _ in sorted_batches[:self.cfg.concurrent_tar_limit - len(self.active_tars)]:
-                    if tar_name not in self.active_tars:
-                        should_submit.append(tar_name)
+            # Also submit when a tar accumulates more than 50 items.  This
+            # prevents small tars from starving the system when there are
+            # few matching images per file.
+            elif len(self.tar_batches[tar_name]) >= 50:
+                should_submit.append(tar_name)
 
-        # Submit extraction OUTSIDE the lock
-        for tar_name_to_submit in should_submit:
+            # If the system is under‑utilized (fewer active tars than the
+            # concurrency limit) or if there are too many pending items,
+            # submit additional batches based on size.
+            # Determine candidate tars sorted by descending batch size.
+            candidate_tars = [
+                (name, len(batch)) for name, batch in self.tar_batches.items() if batch
+            ]
+            candidate_tars.sort(key=lambda x: x[1], reverse=True)
+
+            # Force flush when the total pending exceeds 200 items.  Select
+            # up to ``concurrent_tar_limit`` of the largest batches that are
+            # not already active.
+            if total_pending > 200:
+                for name, _ in candidate_tars:
+                    if name not in self.active_tars and name not in should_submit:
+                        should_submit.append(name)
+                        if len(should_submit) >= self.cfg.concurrent_tar_limit:
+                            break
+            # Otherwise, if we have free slots, submit enough batches to fill
+            # the concurrency limit.  This preserves the original starvation
+            # avoidance logic.
+            elif len(self.active_tars) < self.cfg.concurrent_tar_limit:
+                needed = self.cfg.concurrent_tar_limit - len(self.active_tars)
+                for name, _ in candidate_tars:
+                    if name not in self.active_tars and name not in should_submit:
+                        should_submit.append(name)
+                        needed -= 1
+                        if needed <= 0:
+                            break
+
+        # Submit extraction OUTSIDE the lock to avoid blocking producers.
+        # Use a set to ensure each tar is only submitted once per iteration.
+        for tar_name_to_submit in list(dict.fromkeys(should_submit)):
             self._submit_tar_extraction(tar_name_to_submit)
 
-        
         return True
     
     
@@ -1187,7 +1373,12 @@ class ParallelTarProcessor:
                 # original destination path's extension.
                 ext_from_member = os.path.splitext(member.name)[1] or os.path.splitext(dest_path.name)[1]
                 final_dir = dest_path.parent
-                final_dir.mkdir(parents=True, exist_ok=True)
+                # Only create the directory during extraction if pre-create is disabled.
+                # When pre_create_shards is True, directories have been created
+                # ahead of time in process_row().  Avoiding mkdir here reduces
+                # repeated metadata writes on the destination filesystem.
+                if not self.cfg.pre_create_shards:
+                    final_dir.mkdir(parents=True, exist_ok=True)
                 final_path = final_dir / f"{image_id}{ext_from_member}"
                 temp_path = final_path.with_suffix(final_path.suffix + '.tmp')
 
@@ -1439,8 +1630,20 @@ def process_extractions_optimized(metadata_stream: Iterator[Dict[str, Any]],
     
     # Initialize components
     sharding = DirectorySharding(dest_dir, cfg.files_per_shard)
-    json_writer = BatchedJSONWriter(flush_interval=cfg.json_flush_interval, batch_size=1000, enable_fsync=cfg.enable_fsync) if cfg.per_image_json else None
-    progress_tracker = ValidatingProgressTracker(dest_dir / "progress.json", update_interval=1000, enable_fsync=cfg.enable_fsync)
+    # Initialize JSON writer: use asynchronous writer if configured
+    json_writer: Optional[object]
+    if cfg.per_image_json:
+        if cfg.json_writer_workers and cfg.json_writer_workers > 0:
+            # Use asynchronous queue-based JSON writer with specified workers
+            json_writer = AsyncJSONWriter(workers=cfg.json_writer_workers, enable_fsync=cfg.enable_fsync)
+        else:
+            # Fall back to batched writer
+            json_writer = BatchedJSONWriter(flush_interval=cfg.json_flush_interval, batch_size=1000, enable_fsync=cfg.enable_fsync)
+    else:
+        json_writer = None
+
+    # Use configurable progress update interval
+    progress_tracker = ValidatingProgressTracker(dest_dir / "progress.json", update_interval=cfg.progress_update_interval, enable_fsync=cfg.enable_fsync)
     
     # Validation
     if cfg.validate_on_start:
@@ -1865,6 +2068,23 @@ def build_cli() -> argparse.ArgumentParser:
     p.add_argument("--batch-size", type=int, help="Streaming batch size")
     p.add_argument("--memory-cache", type=int, help="Memory cache size in GB")
 
+    # Additional tuning options
+    p.add_argument(
+        "--progress-update-interval",
+        type=int,
+        help="Number of completed images between progress file updates (default: based on Config)"
+    )
+    p.add_argument(
+        "--json-writer-workers",
+        type=int,
+        help="Number of threads for the asynchronous JSON writer; 0 to disable and use the batched writer"
+    )
+    p.add_argument(
+        "--pre-create-shards",
+        action="store_true",
+        help="Pre-create shard directories ahead of extraction to reduce metadata overhead"
+    )
+
     return p
 
 def apply_cli_overrides(args: argparse.Namespace, cfg: Config) -> None:
@@ -1964,6 +2184,14 @@ def apply_cli_overrides(args: argparse.Namespace, cfg: Config) -> None:
         cfg.batch_size = args.batch_size
     if args.memory_cache is not None:
         cfg.max_memory_cache_gb = args.memory_cache
+
+    # New configurable fields
+    if hasattr(args, 'progress_update_interval') and args.progress_update_interval is not None:
+        cfg.progress_update_interval = args.progress_update_interval
+    if hasattr(args, 'json_writer_workers') and args.json_writer_workers is not None:
+        cfg.json_writer_workers = args.json_writer_workers
+    if hasattr(args, 'pre_create_shards') and args.pre_create_shards:
+        cfg.pre_create_shards = True
 
 # ---------------------------------------------------------------------------
 # Tar Index (stub for now - implement based on your tar structure)
