@@ -130,6 +130,19 @@ class Config:
     memory_low_water_gb: int = 40 # Resume processing below this memory usage
     max_pending_batches: int = 5  # Maximum tar batches to keep in memory
     enable_fsync: bool = False  # Disable fsync for speed (filesystem will handle it)
+    # ---- Large TAR handling policy -----------------------------------
+    # How to handle tar files >= large_tar_threshold_gb
+    #   - "mmap": memory-map large tars for zero-copy random access
+    #   - "full": fully cache large tars in RAM (ensure enough memory!)
+    #   - "skip": do not cache; read directly from disk
+    large_tars_policy: str = "mmap"
+    large_tar_threshold_gb: int = 8
+    # JSON writer performance
+    json_flush_interval: float = 5.0
+    # Basename collision handling in tar members:
+    #   - "strict": require exact full path when collisions exist; otherwise skip
+    #   - "prefer_top": prefer top-level entry if present; else shortest path
+    on_basename_collision: str = "strict"
 
 # ---------------------------------------------------------------------------
 # Directory Sharding
@@ -385,10 +398,12 @@ class ValidatingProgressTracker:
 # ---------------------------------------------------------------------------
 # Memory Cache Manager
 # ---------------------------------------------------------------------------
+
 class MemoryCacheManager:
     """Manages in-memory caching of tar files for fast access."""
     
-    def __init__(self, max_size_gb: int = 20, read_buffer_size_mb: int = 256, use_memory_mapping: bool = False):
+    def __init__(self, max_size_gb: int = 20, read_buffer_size_mb: int = 256, use_memory_mapping: bool = False,
+                 large_tar_threshold_gb: int = 8, large_tars_policy: str = "mmap"):
         self.max_size_bytes = max_size_gb * 1024 * 1024 * 1024
         self.read_buffer_size_mb = read_buffer_size_mb
         self.cache: Dict[str, bytes] = {}
@@ -402,11 +417,16 @@ class MemoryCacheManager:
         self.prefetch_threads = 2
         self.mmap_handles: Dict[str, mmap.mmap] = {}  # Memory mapped files
         self.use_memory_mapping = use_memory_mapping
+        # Large tar handling
+        self.large_tar_threshold_bytes = large_tar_threshold_gb * 1024 ** 3
+        self.large_tar_policy = large_tars_policy
+        if large_tars_policy == "mmap":
+            self.use_memory_mapping = True or self.use_memory_mapping
         self._closed = False
         self.prefetch_threads_list = []
         self._start_prefetch_worker()
         self.in_flight_loads: Set[str] = set()
-        
+
     def _start_prefetch_worker(self):
         """Start background prefetch worker."""
         def prefetch_worker():
@@ -439,7 +459,7 @@ class MemoryCacheManager:
             thread = threading.Thread(target=prefetch_worker, daemon=True)
             thread.start()
             self.prefetch_threads_list.append(thread)
-     
+
     def _try_memory_map(self, tar_path: Path) -> Optional[mmap.mmap]:
         """Try to memory-map a tar file for zero-copy access."""
         if not self.use_memory_mapping:
@@ -462,103 +482,101 @@ class MemoryCacheManager:
             logging.debug(f"Could not memory-map {tar_path}: {e}")
         return None
     
-    
     def _load_tar_to_cache(self, tar_path: Path) -> Optional[bytes]:
-        """Load tar file into memory cache."""
+        """Load tar file into memory cache, honoring large-file policy and using chunked streaming."""
         tar_name = tar_path.name
         
         with self.lock:
             if tar_name in self.cache:
                 self.access_times[tar_name] = time.time()
                 return self.cache[tar_name]
-            
-            # Check if already being loaded, get or create event
-            if tar_name in self.loading_tars:
-                load_event = self.loading_tars[tar_name]
-            else:
-                load_event = None
-        
-        # Wait for other thread to finish loading if needed
+            # Check if already being loaded
+            load_event = self.loading_tars.get(tar_name)
+
+        # If another thread is loading, wait with timeout
         if load_event:
             logging.debug(f"Tar {tar_name} already being loaded, waiting...")
-            # Wait with timeout to prevent infinite blocking
-            if load_event.wait(timeout=300):  # 5 minute timeout
+            if load_event.wait(timeout=300):
                 with self.lock:
                     if tar_name in self.cache:
                         self.access_times[tar_name] = time.time()
                         return self.cache[tar_name]
+                    if tar_name in self.mmap_handles:
+                        self.access_times[tar_name] = time.time()
+                        return None
             else:
                 logging.error(f"Timeout waiting for {tar_name} to load")
                 return None
 
-        # Try memory mapping first
-        if self.use_memory_mapping and tar_name not in self.mmap_handles:
-            mm = self._try_memory_map(tar_path)
-            if mm:
-                load_event = threading.Event()
-                with self.lock:
-                    if tar_name in self.cache or tar_name in self.mmap_handles:
-                        return bytes(mm) if mm else self.cache.get(tar_name)
-                    self.mmap_handles[tar_name] = mm
-                    self.access_times[tar_name] = time.time()
-                return None  # Will be handled by get_tar_handle
-                
         try:
             file_size = tar_path.stat().st_size
             
-            # Skip full-cache of huge tars when not using mmap
-            if file_size > 2 * 1024**3 and not self.use_memory_mapping:
-                logging.info(f"⏭️ Skipping full-cache of large tar ({file_size/1024**3:.1f}GB): {tar_name}")
-                return None
-            
-            # Check if we have space
+            # Large tar handling policy
+            if file_size >= self.large_tar_threshold_bytes:
+                if self.large_tar_policy == "mmap":
+                    mm = self._try_memory_map(tar_path)
+                    if mm:
+                        with self.lock:
+                            if tar_name not in self.mmap_handles:
+                                self.mmap_handles[tar_name] = mm
+                            self.access_times[tar_name] = time.time()
+                        logging.info(f"✅ Using mmap for large tar: {tar_name}")
+                        return None
+                    else:
+                        logging.warning(f"⚠️ mmap requested but failed for {tar_name}. Falling back to direct reads.")
+                        return None
+                elif self.large_tar_policy == "skip" and not self.use_memory_mapping:
+                    logging.info(f"⏭️ Skipping full-cache of large tar ({file_size/1024**3:.1f}GB): {tar_name}")
+                    return None
+                # else: "full" -> proceed
+
+            # Check capacity before loading
             if file_size > self.max_size_bytes:
                 logging.warning(f"Tar file {tar_name} too large for cache ({file_size / 1024**3:.1f}GB)")
                 return None
             
             # Mark as loading
-            load_event = threading.Event()
             with self.lock:
                 if tar_name in self.loading_tars:
                     return None  # Another thread is loading
-                self.loading_tars[tar_name] = load_event
+                evt = threading.Event()
+                self.loading_tars[tar_name] = evt
                 self.in_flight_loads.add(tar_name)
             
-            # Evict old entries if needed
+            # Evict until enough room
             with self.lock:
                 while self.total_size + file_size > self.max_size_bytes and self.cache:
                     self._evict_lru()
             
-            # O_DIRECT not supported by Python's open(), use large buffer instead
-            buffer_size = self.read_buffer_size_mb * 1024 * 1024
-            
-            # For very large files, read in chunks to avoid memory spike
-            if file_size > 2 * 1024**3:  # >2GB
-                buffer_size = min(buffer_size, 512 * 1024 * 1024)
-            else:
-                buffer_size = self.read_buffer_size_mb * 1024 * 1024
-            
-            with open(tar_path, 'rb', buffering=buffer_size) as f:
-                data = f.read()
+            # Read the file in chunks to avoid transient RSS spikes
+            buffer_size = min(self.read_buffer_size_mb * 1024 * 1024, 512 * 1024 * 1024)
+            data_ba = bytearray()
+            with open(tar_path, 'rb') as f:
+                while True:
+                    chunk = f.read(buffer_size)
+                    if not chunk:
+                        break
+                    data_ba.extend(chunk)
+            data = bytes(data_ba)
             
             with self.lock:
                 self.cache[tar_name] = data
                 self.cache_sizes[tar_name] = file_size
                 self.access_times[tar_name] = time.time()
                 self.total_size += file_size
-                if tar_name in self.loading_tars:
-                    event = self.loading_tars.pop(tar_name)
+                event = self.loading_tars.pop(tar_name, None)
+                if event:
                     event.set()  # Signal waiting threads
                 self.in_flight_loads.discard(tar_name)
-                
+
             logging.info(f"✅ Cached {tar_name} (Cache: {self.total_size / 1024**3:.1f}/{self.max_size_bytes / 1024**3:.0f}GB)")
             return data
             
         except Exception as e:
             logging.error(f"Failed to cache {tar_name}: {e}")
             with self.lock:
-                if tar_name in self.loading_tars:
-                    event = self.loading_tars.pop(tar_name)
+                event = self.loading_tars.pop(tar_name, None)
+                if event:
                     event.set()  # Signal error to waiting threads
                 self.in_flight_loads.discard(tar_name)
             return None
@@ -643,6 +661,7 @@ class MemoryCacheManager:
         for mm in self.mmap_handles.values():
             mm.close()
 
+
 # ---------------------------------------------------------------------------
 # Memory Monitor
 # ---------------------------------------------------------------------------
@@ -688,7 +707,8 @@ class ParallelTarProcessor:
         self.progress_tracker = progress_tracker
         self.json_writer = json_writer
         self.cache_manager = MemoryCacheManager(
-            cfg.max_memory_cache_gb, cfg.read_buffer_size_mb, cfg.use_memory_mapping
+            cfg.max_memory_cache_gb, cfg.read_buffer_size_mb, cfg.use_memory_mapping,
+            cfg.large_tar_threshold_gb, cfg.large_tars_policy
         )
         self.memory_monitor = MemoryMonitor(cfg.memory_high_water_gb, cfg.memory_low_water_gb)
 
@@ -842,6 +862,12 @@ class ParallelTarProcessor:
 
         tar_path = Path(self.cfg.source_images_dir) / tar_name
         
+        # Prefetch this tar to warm cache or mmap handle
+        try:
+            self.cache_manager.prefetch([tar_path], priority=True)
+        except Exception:
+            pass
+
         # Submit extraction job
         future = self.extract_executor.submit(
             self._extract_tar_batch_parallel,
@@ -898,8 +924,8 @@ class ParallelTarProcessor:
                 # Build member index keyed by BASENAME -> list[TarInfo]
                 from collections import defaultdict as _dd
                 members_dict = _dd(list)
-                # Only index members we need
-                needed_files = {filename for _, filename, _, _ in batch}
+                # Only index members by BASENAME we need (supports full-path inputs in batch)
+                needed_files = {fn.rsplit('/', 1)[-1] for _, fn, _, _ in batch}
                 for member in tar.getmembers():
                     base_name = member.name.rsplit('/', 1)[-1]
                     if base_name in needed_files:
@@ -949,9 +975,30 @@ class ParallelTarProcessor:
         
         for image_id, filename, dest_path, row_data in chunk:
             try:
-                # Find member by BASENAME (handle collisions by picking first)
-                candidates = members_dict.get(filename, [])
-                member = candidates[0] if candidates else None
+                # Look up by BASENAME (dictionary is keyed by basename)
+                base = filename.rsplit('/', 1)[-1]
+                candidates = members_dict.get(base, [])
+                member = None
+                # If caller provided a full path, prefer exact match among candidates
+                if '/' in filename and candidates:
+                    for cand in candidates:
+                        if cand.name == filename:
+                            member = cand
+                            break
+                if member is None:
+                    if len(candidates) == 1:
+                        member = candidates[0]
+                    elif len(candidates) > 1:
+                        # Disambiguate according to policy
+                        if self.cfg.on_basename_collision == "prefer_top":
+                            top = [c for c in candidates if '/' not in c.name]
+                            if len(top) == 1:
+                                member = top[0]
+                            else:
+                                member = min(candidates, key=lambda c: c.name.count('/'))
+                        else:
+                            logging.debug(f"Ambiguous basename {base}, skipping (provide full path).")
+                            member = None
                 
                 if not member:
                     logging.debug(f"Member {filename} not found in tar")
@@ -1196,7 +1243,7 @@ def process_extractions_optimized(metadata_stream: Iterator[Dict[str, Any]],
     
     # Initialize components
     sharding = DirectorySharding(dest_dir, cfg.files_per_shard)
-    json_writer = BatchedJSONWriter(flush_interval=5.0, batch_size=1000, enable_fsync=cfg.enable_fsync) if cfg.per_image_json else None
+    json_writer = BatchedJSONWriter(flush_interval=cfg.json_flush_interval, batch_size=1000, enable_fsync=cfg.enable_fsync) if cfg.per_image_json else None
     progress_tracker = ValidatingProgressTracker(dest_dir / "progress.json", update_interval=1000)
     
     # Validation
@@ -1697,6 +1744,7 @@ class TarIndex:
     def __init__(self, source_dir: Path, rebuild: bool = False):
         self.source_dir = source_dir
         self.index = {}  # {file_id: tar_name}
+        self.index_paths = {}  # {file_id: internal path within tar (if known)}
         self.lock = threading.Lock()
         
         # Use the existing cache that's already built
@@ -1731,6 +1779,8 @@ class TarIndex:
                     try:
                         file_id = int(file_id_str)
                         self.index[file_id] = tar_name
+                        if '/' in key:
+                            self.index_paths[file_id] = key
                     except ValueError:
                         continue
                 
@@ -1777,10 +1827,13 @@ class TarIndex:
                     # Process the dictionary entries
                     for key in data['files'].keys():
                         # Extract numeric ID from key
-                        file_id_str = key.split('.')[0] if '.' in key else key
+                        base_key = key.rsplit('/', 1)[-1]
+                        file_id_str = base_key.split('.')[0] if '.' in base_key else base_key
                         try:
                             file_id = int(file_id_str)
                             self.index[file_id] = tar_name
+                            if '/' in key:
+                                self.index_paths[file_id] = key
                         except ValueError:
                             continue
                                        
@@ -1793,37 +1846,48 @@ class TarIndex:
 
         """
          Find which tar contains an image based on image ID.
-        Returns (tar_name, filename) or None.
+        Returns (tar_name, filename_or_fullpath) or None.
         """
         with self.lock:
             tar_name = self.index.get(image_id)
             if not tar_name:
                 return None
+            internal_path = self.index_paths.get(image_id)
 
-            # Try to get actual extension from tar's JSON first
+        actual_ext = None
+        if internal_path:
+            actual_ext = os.path.splitext(internal_path)[1]
+        else:
+            # Try to get extension/path from the tar's sidecar JSON if available
             json_path = self.source_dir / tar_name.replace('.tar', '.json')
-            actual_ext = None
             if json_path.exists():
                 try:
                     with open(json_path, 'r') as f:
                         data = json.load(f)
                         files = data.get('files', {})
                         if isinstance(files, dict):
-                            match_key = next((k for k in files.keys() if isinstance(k, str) and k.startswith(f"{image_id}.")), None)
-                            if match_key:
-                                actual_ext = os.path.splitext(match_key)[1]
+                            for k in files.keys():
+                                if not isinstance(k, str):
+                                    continue
+                                if k.startswith(f"{image_id}.") or k.rsplit('/', 1)[-1].startswith(f"{image_id}."):
+                                    actual_ext = os.path.splitext(k)[1]
+                                    internal_path = k  # Prefer discovered full path
+                                    with self.lock:
+                                        self.index_paths[image_id] = internal_path
+                                    break
                 except Exception:
                     pass
 
-            # Fall back to URL extension or default
-            ext = actual_ext or '.jpg'
-            if file_url and not actual_ext:
-                ext_match = re.search(r'\.(jpg|jpeg|png|gif|webp)$', file_url, re.IGNORECASE)
-                if ext_match:
-                    ext = ext_match.group(0)
+        # Fall back to URL extension or default
+        ext = actual_ext or '.jpg'
+        if file_url and not actual_ext:
+            ext_match = re.search(r'\.(jpg|jpeg|png|gif|webp)$', file_url, re.IGNORECASE)
+            if ext_match:
+                ext = ext_match.group(0)
 
-            filename = f"{image_id}{ext}"
-            return (tar_name, filename)
+        filename = internal_path if internal_path else f"{image_id}{ext}"
+        return (tar_name, filename)
+
 
     def get_statistics(self) -> Dict[str, Any]:
         """Get index statistics for debugging."""
