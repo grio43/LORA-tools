@@ -185,7 +185,15 @@ class Config:
     prefetch_tars: int = 2
     max_memory_cache_gb: int = 100  # Total RAM allocated for caching tars
     parallel_tar_extraction: bool = False  # Extract from multiple tars simultaneously
-    write_buffer_size_mb: int = 512  # Larger write buffer for high‑throughput RAID 0
+    # The write buffer size controls how much data Python buffers in memory
+    # when writing each image file to disk.  Extremely large buffers (hundreds
+    # of megabytes) can lead to substantial memory overhead because each
+    # concurrent writer allocates its own buffer.  In practice there is
+    # little benefit to buffers larger than a few tens of megabytes – the
+    # underlying filesystem will coalesce writes efficiently.  Reduce the
+    # default from 512MB to a more reasonable 32MB to avoid excessive
+    # memory consumption and improve overall throughput.
+    write_buffer_size_mb: int = 32  # Reasonable write buffer for high‑throughput RAID 0
     read_buffer_size_mb: int = 1024  # Larger read buffer for RAID 5 sequential reads
     use_memory_mapping: bool = False  # Disable to prevent double memory usage
     concurrent_tar_limit: int = 2  # Limit concurrent tars to avoid disk contention
@@ -1111,7 +1119,8 @@ class ParallelTarProcessor:
         Access to tar is guarded by a lock because TarFile is not thread-safe.
         """
         successful_ids = []
-        buffer_size = max(1, self.cfg.write_buffer_size_mb) * 1024 * 1024  # honor configured cap
+        # Note: buffer_size is computed per file below; we no longer allocate a giant
+        # shared buffer here because it would be unused and wasteful.
         
         for image_id, filename, dest_path, row_data in chunk:
             try:
@@ -1151,57 +1160,78 @@ class ParallelTarProcessor:
                         else:
                             # deterministic but explicit: choose shortest path
                             member = min(id_candidates, key=lambda c: c.name.count('/')) if id_candidates else None
-                
+
                 if not member:
                     logging.debug(f"Member {filename} not found in tar")
                     continue
-                
-                # Extract file data
+
+                # Extract file data.  All interactions with the TarFile must be
+                # performed under the tar_io_lock because TarFile objects are
+                # not thread‑safe.  Once the data is read into memory, the
+                # lock can be released so that disk writes can proceed in
+                # parallel without blocking other readers.
+                data: Optional[bytes] = None
+                with tar_io_lock:
+                    file_obj = tar.extractfile(member)
+                    if file_obj:
+                        data = file_obj.read()
+                        file_obj.close()
+
+                # If the file could not be read, skip it
+                if not data:
+                    logging.debug(f"Could not extract data for {filename}")
+                    continue
+
+                # Determine the final extension based on the member name.  If
+                # the member has no extension (rare), fall back to the
+                # original destination path's extension.
+                ext_from_member = os.path.splitext(member.name)[1] or os.path.splitext(dest_path.name)[1]
+                final_dir = dest_path.parent
+                final_dir.mkdir(parents=True, exist_ok=True)
+                final_path = final_dir / f"{image_id}{ext_from_member}"
+                temp_path = final_path.with_suffix(final_path.suffix + '.tmp')
+
+                start_write = time.time()
+                # Cap the buffer size to avoid excessive memory usage per open
+                # call.  Even if the user configures a very large buffer, we
+                # limit it here to 64MB which is sufficient for high‑speed
+                # writes and prevents unnecessary allocation.
+                configured_buffer_mb = max(1, self.cfg.write_buffer_size_mb)
+                buffer_mb = min(configured_buffer_mb, 64)
+                buffer_size_bytes = buffer_mb * 1024 * 1024
                 try:
-                    start_write = time.time()
-                    with tar_io_lock:
-                        file_obj = tar.extractfile(member)
-                        if file_obj:
-                            data = file_obj.read()
-                            file_obj.close()
-                        
-                        # Direct synchronous write with large buffer
-                        # Recompute destination extension from member in case of ID->ext probing
-                        ext_from_member = os.path.splitext(member.name)[1] or os.path.splitext(dest_path.name)[1]
-                        final_dir = dest_path.parent
-                        final_dir.mkdir(parents=True, exist_ok=True)
-                        final_path = final_dir / f"{image_id}{ext_from_member}"
-                        temp_path = final_path.with_suffix(final_path.suffix + '.tmp')
-                        with open(temp_path, 'wb', buffering=buffer_size) as f:
-                            f.write(data)
-                            # Only fsync if explicitly enabled (usually disabled for speed)
-                            if self.cfg.enable_fsync:
-                                f.flush()
-                                os.fsync(f.fileno())
-                        temp_path.replace(final_path)
-                        # Track write statistics
-                        with self.stats_lock:
-                            self.stats['total_bytes_written'] += len(data)
-                            self.stats['write_time'] += (time.time() - start_write)
+                    with open(temp_path, 'wb', buffering=buffer_size_bytes) as f:
+                        f.write(data)
+                        if self.cfg.enable_fsync:
+                            f.flush()
+                            os.fsync(f.fileno())
+                    # Atomic rename once write completes
+                    temp_path.replace(final_path)
+                except Exception as write_err:
+                    logging.error(f"Failed to write image {final_path}: {write_err}")
+                    continue
 
-                    # Write JSON if needed
-                    if self.cfg.per_image_json and self.json_writer:
-                        json_path = final_dir / f"{image_id}.json"
-                        json_data = prepare_json_data(row_data, self.cfg)
-                        self.json_writer.add_write(json_path, json_data)
-                        # Cache discovered internal path for future lookups
-                        try:
-                            if hasattr(self.tar_index, "cache_discovered_path"):
-                                self.tar_index.cache_discovered_path(image_id, tar_name, member.name)
-                        except Exception:
-                            pass
+                # Track write statistics
+                with self.stats_lock:
+                    self.stats['total_bytes_written'] += len(data)
+                    self.stats['write_time'] += (time.time() - start_write)
 
-                    # Only mark successful AFTER write completes
-                    self.progress_tracker.mark_completed(image_id)                       
-                    successful_ids.append(image_id)
+                # Write JSON metadata if configured
+                if self.cfg.per_image_json and self.json_writer:
+                    json_path = final_dir / f"{image_id}.json"
+                    json_data = prepare_json_data(row_data, self.cfg)
+                    self.json_writer.add_write(json_path, json_data)
+                    # Cache discovered internal path for future lookups
+                    try:
+                        if hasattr(self.tar_index, "cache_discovered_path"):
+                            self.tar_index.cache_discovered_path(image_id, tar_name, member.name)
+                    except Exception:
+                        pass
 
-                except Exception as e:
-                    logging.debug(f"Direct extraction failed for {filename}: {e}")
+                # Mark as completed only after the write has finished
+                self.progress_tracker.mark_completed(image_id)
+                successful_ids.append(image_id)
+
             except Exception as e:
                 logging.error(f"Unexpected error during extraction of {filename}: {e}")
 
