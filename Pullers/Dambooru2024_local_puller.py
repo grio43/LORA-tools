@@ -173,7 +173,7 @@ class Config:
     workers: int = 24  # Increased for 32 threads
     io_workers: int = 12  # Dedicated I/O workers for RAID
     files_per_shard: int = 10000
-    batch_size: int = 2  # Larger batches for streaming
+    batch_size: int = 1000 # Larger batches for streaming
     tar_batch_size: int = 5000  # Much larger for RAID
     use_streaming: bool = False
     
