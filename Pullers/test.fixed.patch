@@ -2,7 +2,7 @@ diff --git a/Dambooru2024_local_puller.py b/Dambooru2024_local_puller.py
 index 2911ca6..6d609ee 100644
 --- a/Dambooru2024_local_puller.py
 +++ b/Dambooru2024_local_puller.py
-@@ -17,20 +17,79 @@
+@@ -17,22 +17,81 @@
  import threading
  import time
  import tarfile
@@ -91,7 +91,7 @@ index 2911ca6..6d609ee 100644
  # ---------------------------------------------------------------------------
  # Optimized Configuration for RAID
  # ---------------------------------------------------------------------------
-@@ -318,7 +377,7 @@ class ValidatingProgressTracker:
+@@ -318,6 +377,6 @@ class ValidatingProgressTracker:
      """Tracks extraction progress with validation and persistent records."""
      
 -    def __init__(self, progress_file: Path, update_interval: int = 1000):
@@ -107,7 +107,7 @@ index 2911ca6..6d609ee 100644
      
      def _load_progress(self):
          """Load existing progress from file."""
-@@ -520,7 +580,7 @@ class MemoryCacheManager:
+@@ -520,8 +580,8 @@ class MemoryCacheManager:
      def __init__(self, max_size_gb: int = 20, read_buffer_size_mb: int = 256, use_memory_mapping: bool = False,
                   large_tar_threshold_gb: int = 8, large_tars_policy: str = "mmap"):
          self.max_size_bytes = max_size_gb * 1024 * 1024 * 1024
@@ -128,7 +128,7 @@ index 2911ca6..6d609ee 100644
                      self._load_tar_to_cache(tar_path)
  
                  except Exception as e:
-@@ -610,12 +668,15 @@ class MemoryCacheManager:
+@@ -610,11 +668,12 @@ class MemoryCacheManager:
                      data_ba.extend(chunk)
 -            data = bytes(data_ba)
 -            
@@ -145,7 +145,7 @@ index 2911ca6..6d609ee 100644
                  event = self.loading_tars.pop(tar_name, None)
                  if event:
                      event.set()  # Signal waiting threads
-@@ -639,39 +700,46 @@ class MemoryCacheManager:
+@@ -639,40 +700,45 @@ class MemoryCacheManager:
          
          logging.debug(f"Evicted {tar_name} from cache")
      
@@ -222,7 +222,7 @@ index 2911ca6..6d609ee 100644
          for path in tar_paths:
              if path.name not in self.cache and path.name not in self.mmap_handles:
                  with self.prefetch_lock:
-@@ -867,6 +935,9 @@ class ParallelTarProcessor:
+@@ -867,10 +935,12 @@ class ParallelTarProcessor:
                  for member in tar.getmembers():
                      base_name = member.name.rsplit('/', 1)[-1]
                      if base_name in needed_files:
@@ -237,7 +237,7 @@ index 2911ca6..6d609ee 100644
                  # Optimize chunk size for RAID stripe alignment
                  chunk_size = max(50, len(batch) // self.cfg.io_workers)
                  chunks = [batch[i:i+chunk_size] for i in range(0, len(batch), chunk_size)]
-@@ -878,7 +949,7 @@ class ParallelTarProcessor:
+@@ -878,8 +949,8 @@ class ParallelTarProcessor:
                      
                      for chunk in chunks:
                          future = io_pool.submit(
@@ -247,7 +247,7 @@ index 2911ca6..6d609ee 100644
                          )
                          futures.append(future)
                      
-@@ -910,8 +981,10 @@ class ParallelTarProcessor:
+@@ -910,6 +981,8 @@ class ParallelTarProcessor:
      def _extract_chunk(self, tar: tarfile.TarFile, members_dict: Dict[str, Any],
 -                      chunk: List[Tuple[int, str, Path, Dict]]) -> List[int]:
 -        """Extract a chunk of files from tar."""
@@ -258,7 +258,7 @@ index 2911ca6..6d609ee 100644
          successful_ids = []
          buffer_size = min(self.cfg.write_buffer_size_mb, 64) * 1024 * 1024  # Cap buffer size
          
-@@ -953,10 +1026,12 @@ class ParallelTarProcessor:
+@@ -953,9 +1026,10 @@ class ParallelTarProcessor:
                  try:
                      start_write = time.time()
 -                    file_obj = tar.extractfile(member)
