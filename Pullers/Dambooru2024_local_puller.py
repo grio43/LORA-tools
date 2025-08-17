@@ -27,13 +27,10 @@ from typing import List, Optional, Iterator, Dict, Any, Set, Tuple, Deque
 from tempfile import TemporaryDirectory
 from functools import lru_cache
 import multiprocessing as mp
-from queue import Queue, Empty
 import io
-import fcntl
 
 import polars as pl
 import pandas as pd
-from tqdm import tqdm
 import psutil
 
 # ---------------------------------------------------------------------------
@@ -58,7 +55,8 @@ class Config:
     width_col: str = "image_width"
     height_col: str = "image_height"
     file_path_col: str = "file_url"
-    id_col: str = "id"
+    file_id_col: str = "media_asset.id"  # Not used - kept for compatibility
+    id_col: str = "id"  # Primary ID for both finding files and metadata association
 
     # ---- Filtering (unchanged) --------------------------------------------
     enable_include_tags: bool = False
@@ -115,19 +113,23 @@ class Config:
     # ---- RAID-Optimized Performance ---------------------------------------
     workers: int = 24  # Increased for 32 threads
     io_workers: int = 12  # Dedicated I/O workers for RAID
-    files_per_shard: int = 5000
-    batch_size: int = 10000  # Larger batches for streaming
-    tar_batch_size: int = 50000  # Much larger for RAID
+    files_per_shard: int = 10000
+    batch_size: int = 1000  # Larger batches for streaming
+    tar_batch_size: int = 500  # Much larger for RAID
     use_streaming: bool = True
     
     # New RAID optimizations
-    prefetch_tars: int = 6  # Number of tar files to prefetch into RAM
-    max_memory_cache_gb: int = 100  # Use up to 100GB for caching
+    prefetch_tars: int = 1  # Reduce to 1 to prevent duplicate loading
+    max_memory_cache_gb: int = 100  # Increase to 100GB since you have 255GB
     parallel_tar_extraction: bool = True  # Extract from multiple tars simultaneously
     write_buffer_size_mb: int = 256  # Large write buffers for RAID 0
     read_buffer_size_mb: int = 512  # Large read buffers for RAID 5
-    use_memory_mapping: bool = True  # Memory-map tar files when possible
-    concurrent_tar_limit: int = 6  # Process up to 4 tar files simultaneously
+    use_memory_mapping: bool = False  # Disable to prevent double memory usage
+    concurrent_tar_limit: int = 2  # Reduce to prevent contention
+    memory_high_water_gb: int = 100  # Pause processing above this memory usage
+    memory_low_water_gb: int = 40 # Resume processing below this memory usage
+    max_pending_batches: int = 5  # Maximum tar batches to keep in memory
+    enable_fsync: bool = False  # Disable fsync for speed (filesystem will handle it)
 
 # ---------------------------------------------------------------------------
 # Directory Sharding
@@ -178,6 +180,7 @@ class BatchedJSONWriter:
         self.last_flush = time.time()
         self.lock = threading.Lock()
         self.metadata_to_tar_id = {}  # Map metadata row IDs to actual tar IDs
+        self.in_flight_writes = []  # Track writes in progress
         self._closed = False
         self._flush_thread = None
         self._start_flush_thread()
@@ -197,25 +200,38 @@ class BatchedJSONWriter:
     def add_write(self, path: Path, data: Dict[str, Any]):
         """Add a JSON write to the buffer."""
         with self.lock:
-            if self._closed:
+            if self._closed:                    
                 return
+        
             self.buffer.append((path, data))
             
             if len(self.buffer) >= self.batch_size:
                 self._flush_buffer()
     
     def _flush_buffer(self):
-        """Flush all buffered writes to disk."""
-        if not self.buffer:
+        """Flush buffer to disk - fixed to actually write data."""
+        to_write = []
+        with self.lock:
+            if not self.buffer:
+                return
+            
+            to_write = self.buffer.copy()
+            self.buffer.clear()
+            self.last_flush = time.time()
             return
         
-        logging.debug(f"💾 Flushing {len(self.buffer)} JSON writes...")
+        # Log actual buffer size before clearing
+        logging.debug(f"💾 Flushing {len(to_write)} JSON writes...")
         
-        for path, data in self.buffer:
+        
+        # Do I/O without lock
+        for path, data in to_write:
             self._atomic_write_json(path, data)
         
-        self.buffer.clear()
-        self.last_flush = time.time()
+        # Remove from in-flight after completion
+        with self.lock:
+            if to_write in self.in_flight_writes:
+                self.in_flight_writes.remove(to_write)
     
     def _atomic_write_json(self, path: Path, data: Dict[str, Any]):
         """Write JSON file atomically."""
@@ -223,6 +239,8 @@ class BatchedJSONWriter:
         try:
             with open(tmp_path, 'w', encoding='utf-8') as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())  # Ensure data is on disk before rename                
             tmp_path.replace(path)
         except Exception as e:
             logging.error(f"❌ Failed to write {path}: {e}")
@@ -233,9 +251,23 @@ class BatchedJSONWriter:
         """Close writer and flush remaining data."""
         with self.lock:
             self._closed = True
-            self._flush_buffer()
+        
+        # Flush remaining buffer
+        self._flush_buffer()
+        
+        # Wait for flush thread with timeout
         if self._flush_thread and self._flush_thread.is_alive():
-            self._flush_thread.join(timeout=1.0)
+            self._flush_thread.join(timeout=10.0)
+            if self._flush_thread.is_alive():
+                logging.warning("⚠️ JSON flush thread did not terminate, forcing flush...")
+                # Force flush any remaining in-flight writes
+                with self.lock:
+                    for to_write in self.in_flight_writes:
+                        for path, data in to_write:
+                            try:
+                                self._atomic_write_json(path, data)
+                            except Exception as e:
+                                logging.error(f"❌ Failed to force flush {path}: {e}")
 
 # ---------------------------------------------------------------------------
 # Validating Progress Tracker
@@ -289,6 +321,10 @@ class ValidatingProgressTracker:
         try:
             with open(tmp_path, 'w') as f:
                 json.dump(data, f, indent=2)
+                f.flush()
+                # Only fsync if explicitly configured (respect enable_fsync from config)
+                if getattr(self, 'enable_fsync', False):
+                    os.fsync(f.fileno())       
             tmp_path.replace(self.progress_file)
         except Exception as e:
             logging.error(f"❌ Failed to save progress: {e}")
@@ -314,14 +350,33 @@ class ValidatingProgressTracker:
     def validate_files(self, sharding: DirectorySharding, auto_clean: bool = True):
         """Validate that all completed files actually exist."""
         logging.info("🔍 Starting file validation...")
-        # Implementation simplified for local use
-        pass
+        invalid_ids = []
+        for image_id in list(self.completed_ids):
+            exists, _ = sharding.file_exists(image_id)
+            if not exists:
+                invalid_ids.append(image_id)
+                if auto_clean:
+                    self.completed_ids.discard(image_id)
+        
+        if invalid_ids:
+            logging.warning(f"⚠️ Found {len(invalid_ids)} invalid completion records")
+            if auto_clean:
+                logging.info(f"✅ Cleaned up invalid records")
+                self._save_progress()
     
     def full_filesystem_scan(self, sharding: DirectorySharding):
         """Perform full filesystem scan."""
         logging.info("🔍 Performing full filesystem scan...")
-        # Implementation simplified for local use
-        pass
+        found_ids = set()
+        for shard_dir in sharding.base_dir.iterdir():
+            if shard_dir.is_dir() and shard_dir.name.startswith("shard_"):
+                for file_path in shard_dir.iterdir():
+                    if file_path.is_file() and file_path.stem.isdigit():
+                        found_ids.add(int(file_path.stem))
+        
+        logging.info(f"📊 Found {len(found_ids):,} files on filesystem")
+        self.completed_ids = found_ids
+        self._save_progress()
 
 # ---------------------------------------------------------------------------
 # Memory Cache Manager
@@ -329,7 +384,7 @@ class ValidatingProgressTracker:
 class MemoryCacheManager:
     """Manages in-memory caching of tar files for fast access."""
     
-    def __init__(self, max_size_gb: int = 100, read_buffer_size_mb: int = 256):
+    def __init__(self, max_size_gb: int = 20, read_buffer_size_mb: int = 256, use_memory_mapping: bool = False):
         self.max_size_bytes = max_size_gb * 1024 * 1024 * 1024
         self.read_buffer_size_mb = read_buffer_size_mb
         self.cache: Dict[str, bytes] = {}
@@ -337,28 +392,45 @@ class MemoryCacheManager:
         self.access_times: Dict[str, float] = {}
         self.total_size = 0
         self.lock = threading.Lock()
-        self.prefetch_queue: Queue = Queue()
-        self.prefetch_threads = 4
-        self.prefetch_executor = ThreadPoolExecutor(max_workers=self.prefetch_threads)
-        self._start_prefetch_worker()
+        self.loading_tars: Dict[str, threading.Event] = {}  # Track tars being loaded with events
+        self.prefetch_queue = []  # Simple list instead of Queue
+        self.prefetch_lock = threading.Lock()
+        self.prefetch_threads = 2
         self.mmap_handles: Dict[str, mmap.mmap] = {}  # Memory mapped files
+        self.use_memory_mapping = use_memory_mapping
+        self._closed = False
+        self.prefetch_threads_list = []
+        self._start_prefetch_worker()
+        self.in_flight_loads: Set[str] = set()
         
     def _start_prefetch_worker(self):
         """Start background prefetch worker."""
         def prefetch_worker():
             while True:
                 try:
-                    tar_path = self.prefetch_queue.get(timeout=1)
+                    if self._closed:
+                        break
+                    
+                    with self.prefetch_lock:
+                        # Find first tar not already being loaded
+                        tar_path = None
+                        for i, path in enumerate(self.prefetch_queue):
+                            if path and path.name not in self.in_flight_loads:
+                                tar_path = self.prefetch_queue.pop(i)
+                                break
+                     
+                    if tar_path is None:
+                        time.sleep(0.1)
+                        continue
+                    
                     if tar_path is None:
                         break
                     self._load_tar_to_cache(tar_path)
-                except Empty:
-                    continue
+
                 except Exception as e:
                     logging.error(f"Prefetch error: {e}")
                     
         # Start multiple prefetch threads for better throughput
-        self.prefetch_threads_list = []
         for i in range(self.prefetch_threads):
             thread = threading.Thread(target=prefetch_worker, daemon=True)
             thread.start()
@@ -366,13 +438,19 @@ class MemoryCacheManager:
      
     def _try_memory_map(self, tar_path: Path) -> Optional[mmap.mmap]:
         """Try to memory-map a tar file for zero-copy access."""
+        if not self.use_memory_mapping:
+             return None
         try:
             fd = os.open(tar_path, os.O_RDONLY)
-            file_size = os.fstat(fd).st_size
-            
+            try:
+                file_size = os.fstat(fd).st_size
+            except:
+                os.close(fd)
+                raise
             # Only mmap files that fit in reasonable memory
             if file_size < 10 * 1024**3:  # 10GB limit for mmap
                 mm = mmap.mmap(fd, file_size, access=mmap.ACCESS_READ)
+                os.close(fd)  # Close the file descriptor after creating mmap
                 logging.info(f"📍 Memory-mapped {tar_path.name} ({file_size / 1024**3:.1f}GB)")
                 return mm
             os.close(fd)
@@ -389,15 +467,37 @@ class MemoryCacheManager:
             if tar_name in self.cache:
                 self.access_times[tar_name] = time.time()
                 return self.cache[tar_name]
+            
+            # Check if already being loaded, get or create event
+            if tar_name in self.loading_tars:
+                load_event = self.loading_tars[tar_name]
+            else:
+                load_event = None
+        
+        # Wait for other thread to finish loading if needed
+        if load_event:
+            logging.debug(f"Tar {tar_name} already being loaded, waiting...")
+            # Wait with timeout to prevent infinite blocking
+            if load_event.wait(timeout=300):  # 5 minute timeout
+                with self.lock:
+                    if tar_name in self.cache:
+                        self.access_times[tar_name] = time.time()
+                        return self.cache[tar_name]
+            else:
+                logging.error(f"Timeout waiting for {tar_name} to load")
+                return None
 
         # Try memory mapping first
-        if tar_name not in self.mmap_handles:
+        if self.use_memory_mapping and tar_name not in self.mmap_handles:
             mm = self._try_memory_map(tar_path)
             if mm:
+                load_event = threading.Event()
                 with self.lock:
+                    if tar_name in self.cache or tar_name in self.mmap_handles:
+                        return bytes(mm) if mm else self.cache.get(tar_name)
                     self.mmap_handles[tar_name] = mm
                     self.access_times[tar_name] = time.time()
-                return bytes(mm)
+                return None  # Will be handled by get_tar_handle
                 
         try:
             file_size = tar_path.stat().st_size
@@ -407,20 +507,25 @@ class MemoryCacheManager:
                 logging.warning(f"Tar file {tar_name} too large for cache ({file_size / 1024**3:.1f}GB)")
                 return None
             
+            # Mark as loading
+            load_event = threading.Event()
+            with self.lock:
+                if tar_name in self.loading_tars:
+                    return None  # Another thread is loading
+                self.loading_tars[tar_name] = load_event
+                self.in_flight_loads.add(tar_name)
+            
             # Evict old entries if needed
             with self.lock:
                 while self.total_size + file_size > self.max_size_bytes and self.cache:
                     self._evict_lru()
             
-            # Load file with large buffer and optional O_DIRECT
-            logging.info(f"🔥 Loading {tar_name} into RAM cache ({file_size / 1024**3:.1f}GB)...")
+            # O_DIRECT not supported by Python's open(), use large buffer instead
+            buffer_size = self.read_buffer_size_mb * 1024 * 1024
             
-            # Use O_DIRECT for large files to bypass OS cache
-            flags = os.O_RDONLY
-            if hasattr(os, 'O_DIRECT') and file_size > 1024**3:  # >1GB
-                flags |= os.O_DIRECT
-                # Align buffer for O_DIRECT
-                buffer_size = 512 * 1024 * 1024  # 512MB aligned
+            # For very large files, read in chunks to avoid memory spike
+            if file_size > 2 * 1024**3:  # >2GB
+                buffer_size = min(buffer_size, 512 * 1024 * 1024)
             else:
                 buffer_size = self.read_buffer_size_mb * 1024 * 1024
             
@@ -432,12 +537,21 @@ class MemoryCacheManager:
                 self.cache_sizes[tar_name] = file_size
                 self.access_times[tar_name] = time.time()
                 self.total_size += file_size
+                if tar_name in self.loading_tars:
+                    event = self.loading_tars.pop(tar_name)
+                    event.set()  # Signal waiting threads
+                self.in_flight_loads.discard(tar_name)
                 
             logging.info(f"✅ Cached {tar_name} (Cache: {self.total_size / 1024**3:.1f}/{self.max_size_bytes / 1024**3:.0f}GB)")
             return data
             
         except Exception as e:
             logging.error(f"Failed to cache {tar_name}: {e}")
+            with self.lock:
+                if tar_name in self.loading_tars:
+                    event = self.loading_tars.pop(tar_name)
+                    event.set()  # Signal error to waiting threads
+                self.in_flight_loads.discard(tar_name)
             return None
     
     def _evict_lru(self):
@@ -453,6 +567,11 @@ class MemoryCacheManager:
         del self.cache_sizes[tar_name]
         del self.access_times[tar_name]
         self.total_size -= size
+
+        # Also evict mmap handle if present
+        if tar_name in self.mmap_handles:
+            self.mmap_handles[tar_name].close()
+            del self.mmap_handles[tar_name]        
         
         logging.debug(f"Evicted {tar_name} from cache")
     
@@ -468,10 +587,12 @@ class MemoryCacheManager:
                 return tarfile.open(fileobj=io.BytesIO(data), mode='r')
 
         # Try memory mapped version
-        with self.lock:
-            if tar_name in self.mmap_handles:
-                self.access_times[tar_name] = time.time()
-                return tarfile.open(fileobj=io.BytesIO(self.mmap_handles[tar_name]), mode='r')
+        if self.use_memory_mapping:
+            with self.lock:
+                if tar_name in self.mmap_handles:
+                    self.access_times[tar_name] = time.time()
+                    # Use mmap directly without copying to BytesIO
+                    return tarfile.open(fileobj=self.mmap_handles[tar_name], mode='r')
          
         # Load into cache if possible
         data = self._load_tar_to_cache(tar_path)
@@ -479,31 +600,66 @@ class MemoryCacheManager:
             return tarfile.open(fileobj=io.BytesIO(data), mode='r')
         
         # Fall back to direct file access with large buffer
-        return tarfile.open(tar_path, 'r', bufsize=self.read_buffer_size_mb * 1024 * 1024)
+        return tarfile.open(tar_path, 'r')
     
     def prefetch(self, tar_paths: List[Path], priority: bool = False):
         """Queue tar files for prefetching."""
         for path in tar_paths:
             if path.name not in self.cache and path.name not in self.mmap_handles:
-                if priority:
-                    # Put at front of queue for priority prefetch
-                    temp_queue = Queue()
-                    temp_queue.put(path)
-                    while not self.prefetch_queue.empty():
-                        temp_queue.put(self.prefetch_queue.get())
-                    self.prefetch_queue = temp_queue
-                else:
-                    self.prefetch_queue.put(path)
+                with self.prefetch_lock:
+                    if priority:
+                        self.prefetch_queue.insert(0, path)
+                    else:
+                        self.prefetch_queue.append(path)
     
     def close(self):
         """Clean up resources."""
-        for _ in range(self.prefetch_threads):
-            self.prefetch_queue.put(None)
+        self._closed = True
+        
+        # Signal any waiting threads
+        with self.lock:
+            for event in self.loading_tars.values():
+                event.set()
+        
         for thread in self.prefetch_threads_list:
-            thread.join(timeout=5)
+            thread.join(timeout=5.0)
+            if thread.is_alive():
+                logging.warning(f"⚠️ Prefetch thread {thread.name} did not terminate")
         # Close memory mapped files
         for mm in self.mmap_handles.values():
             mm.close()
+
+# ---------------------------------------------------------------------------
+# Memory Monitor
+# ---------------------------------------------------------------------------
+class MemoryMonitor:
+    """Monitor memory usage and provide backpressure."""
+    
+    def __init__(self, high_water_gb: int = 45, low_water_gb: int = 35):
+        self.high_water_bytes = high_water_gb * 1024**3
+        self.low_water_bytes = low_water_gb * 1024**3
+        self.is_paused = False
+        self.lock = threading.Lock()
+        
+    def check_memory(self) -> Tuple[bool, float]:
+        """Check memory and return (should_pause, current_usage_gb)."""
+        process = psutil.Process()
+        mem_usage = process.memory_info().rss
+        mem_gb = mem_usage / 1024**3
+        
+        with self.lock:
+            if mem_usage > self.high_water_bytes and not self.is_paused:
+                self.is_paused = True
+                logging.warning(f"⚠️ Memory usage high ({mem_gb:.1f}GB), pausing new processing...")
+                return True, mem_gb
+            elif mem_usage < self.low_water_bytes and self.is_paused:
+                self.is_paused = False
+                logging.info(f"✅ Memory usage normal ({mem_gb:.1f}GB), resuming processing...")
+                return False, mem_gb
+            
+            return self.is_paused, mem_gb
+
+
 
 # ---------------------------------------------------------------------------
 # Parallel Tar Processor
@@ -517,37 +673,73 @@ class ParallelTarProcessor:
         self.sharding = sharding
         self.progress_tracker = progress_tracker
         self.json_writer = json_writer
-        self.cache_manager = MemoryCacheManager(cfg.max_memory_cache_gb, cfg.read_buffer_size_mb)
+        self.cache_manager = MemoryCacheManager(
+            cfg.max_memory_cache_gb, cfg.read_buffer_size_mb, cfg.use_memory_mapping
+        )
+        self.memory_monitor = MemoryMonitor(cfg.memory_high_water_gb, cfg.memory_low_water_gb)
+
+     
         
         # Worker pools
         # Separate pools for CPU-bound and I/O-bound operations
         self.extract_executor = ThreadPoolExecutor(max_workers=cfg.workers, thread_name_prefix="extract")
-        self.io_executor = ThreadPoolExecutor(max_workers=cfg.io_workers, thread_name_prefix="io")
         
         # Statistics
         self.stats = {
             'extracted': 0,
             'failed': 0,
             'skipped': 0,
-            'not_found': 0
+            'not_found': 0,
+            'not_found_ids': [],  # Track individual IDs
+            'total_bytes_written': 0,
+            'write_time': 0.0
         }
         self.stats_lock = threading.Lock()
+
+        # Track timing
+        self.last_write_report = time.time()        
         
         # Tar batches organized by tar file
         self.tar_batches: Dict[str, List[Tuple[int, str, Path, Dict]]] = defaultdict(list)
         self.active_tars: Set[str] = set()
+        self.pending_futures = []
+        self.futures_lock = threading.Lock()  # Lock for pending_futures
         self.tar_lock = threading.Lock()
 
-        # Image write buffer for coalescing
-        self.write_buffer = []
-        self.write_buffer_size = 50  # Batch image writes
+        # Start memory monitoring thread
+        self._start_memory_monitor()
+     
+    def _start_memory_monitor(self):
+        """Start background memory monitoring."""
+        def monitor_memory():
+            while True:
+                time.sleep(2)  # Check every 2 seconds
+                should_pause, mem_gb = self.memory_monitor.check_memory()
+                
+                # Signal backpressure if needed
+                if should_pause:
+                    with self.tar_lock:
+                        # Pause new submissions when memory is high
+                        while self.memory_monitor.is_paused:
+                            time.sleep(1)
+
+        thread = threading.Thread(target=monitor_memory, daemon=True)
+        thread.start()
     
     def process_row(self, row: Dict[str, Any]) -> bool:
         """Process a single metadata row. Returns True if should continue."""
-        image_id = row[self.cfg.id_col]
+        # Use the id column as the primary identifier - it matches the actual image
+        image_id = row[self.cfg.id_col]  # This is the actual image ID that matches tar files
         file_url = row.get(self.cfg.file_path_col, "")
         
-        # Check if already exists
+        # Check memory and actually pause if needed
+        is_paused, mem_gb = self.memory_monitor.check_memory()
+        while is_paused:
+            logging.info(f"⏸️ Paused due to high memory ({mem_gb:.1f}GB), waiting...")
+            time.sleep(2)
+            is_paused, mem_gb = self.memory_monitor.check_memory()
+
+        # Use image_id for checking existence
         file_exists, ext = self.sharding.file_exists(image_id)
         is_completed = self.progress_tracker.is_completed(image_id)
         
@@ -566,48 +758,74 @@ class ParallelTarProcessor:
         if not tar_info:
             with self.stats_lock:
                 self.stats['not_found'] += 1
+                # Track individual IDs for auditing
+                self.stats['not_found_ids'].append(image_id)                
             return True
         
         tar_name, filename = tar_info
+        # Use image_id for output path
         shard_path = self.sharding.get_shard_path(image_id)
-        dest_path = shard_path / filename
+        ext_from_tar = os.path.splitext(filename)[1]  # Get extension from tar filename
+        dest_path = shard_path / f"{image_id}{ext_from_tar}"
         
         # Add to batch
+        should_submit = []
         with self.tar_lock:
+            # Now using image_id consistently
             self.tar_batches[tar_name].append((image_id, filename, dest_path, row))
-            
-            # Process if batch is large enough or we have multiple tars ready
+
+
+            total_pending = sum(len(batch) for batch in self.tar_batches.values())
+
+            if total_pending > self.cfg.max_pending_batches * self.cfg.tar_batch_size:
+                logging.debug(f"📦 {total_pending} items pending extraction")
+
+            # Process if batch is large enough
+            # Reduced concurrent tar processing to avoid write contention
             if len(self.tar_batches[tar_name]) >= self.cfg.tar_batch_size:
-                self._submit_tar_extraction(tar_name)
-            elif len(self.tar_batches) >= self.cfg.concurrent_tar_limit * 3:
-                # Process the largest batch to free up memory  
-                largest_tar = max(self.tar_batches.items(), key=lambda x: len(x[1]))[0]
-                if largest_tar not in self.active_tars:
-                    self._submit_tar_extraction(largest_tar)
+                should_submit.append(tar_name)
+            # Process smaller batches too to avoid starvation
+            elif len(self.active_tars) < self.cfg.concurrent_tar_limit:
+                # Sort by batch size and submit multiple if we have capacity
+                sorted_batches = sorted(
+                    [(name, len(batch)) for name, batch in self.tar_batches.items() if batch],
+                    key=lambda x: x[1], reverse=True
+                )
+                for tar_name, _ in sorted_batches[:self.cfg.concurrent_tar_limit - len(self.active_tars)]:
+                    if tar_name not in self.active_tars:
+                        should_submit.append(tar_name)
+
+        # Submit extraction OUTSIDE the lock
+        for tar_name_to_submit in should_submit:
+            self._submit_tar_extraction(tar_name_to_submit)
+
         
         return True
     
+    
     def _submit_tar_extraction(self, tar_name: str):
         """Submit a tar batch for extraction."""
-        if tar_name in self.active_tars:
-            return
+        with self.tar_lock:
+            if tar_name in self.active_tars:
+                return
+            if tar_name not in self.tar_batches or not self.tar_batches[tar_name]:
+                return            
+            # Mark as active immediately to prevent double submission
+            self.active_tars.add(tar_name)
         
-        batch = self.tar_batches[tar_name]
-        if not batch:
-            return
+        # Wait for capacity if too many active
+        while len(self.active_tars) >= self.cfg.concurrent_tar_limit:
+            time.sleep(0.1)
+            self._cleanup_completed_futures()
         
-        self.active_tars.add(tar_name)
-        tar_path = Path(self.cfg.source_images_dir) / tar_name
+        with self.tar_lock:
+            batch = self.tar_batches.get(tar_name, [])
+            if not batch:
+                self.active_tars.discard(tar_name)
+                return
         
-        # Aggressive prefetching - prefetch more tars
-        next_tars = list(self.tar_batches.keys())[:self.cfg.prefetch_tars * 2]
-        next_paths = [Path(self.cfg.source_images_dir) / t for t in next_tars if t != tar_name]
 
-        # Priority prefetch the next tar to be processed
-        if next_paths:
-            self.cache_manager.prefetch(next_paths[:2], priority=True)
-            if len(next_paths) > 2:
-                self.cache_manager.prefetch(next_paths[2:], priority=False)
+        tar_path = Path(self.cfg.source_images_dir) / tar_name
         
         # Submit extraction job
         future = self.extract_executor.submit(
@@ -617,6 +835,10 @@ class ParallelTarProcessor:
         
         # Clear batch to free memory
         self.tar_batches[tar_name] = []
+
+        # Track future
+        with self.futures_lock:
+            self.pending_futures.append(future)
         
         # Handle completion asynchronously
         def handle_completion(f):
@@ -634,6 +856,16 @@ class ParallelTarProcessor:
                     self.active_tars.discard(tar_name)
         
         future.add_done_callback(handle_completion)
+
+    def _cleanup_completed_futures(self):
+        """Remove completed futures from tracking."""
+        with self.futures_lock:
+            if self.pending_futures:
+                completed = [f for f in self.pending_futures if f.done()]
+                for f in completed:
+                    self.pending_futures.remove(f)
+            return len(completed)
+        return 0
     
     def _extract_tar_batch_parallel(self, tar_path: Path, 
                                    batch: List[Tuple[int, str, Path, Dict]]) -> List[int]:
@@ -648,14 +880,22 @@ class ParallelTarProcessor:
                 return successful_ids
             
             try:
-                # Get all members for lookup
-                members_dict = {m.name: m for m in tar.getmembers()}
-                
+                # Build member index more efficiently using getmember
+                members_dict = {}
+                # Only index members we need
+                needed_files = {filename for _, filename, _, _ in batch}
+                for member in tar.getmembers():
+                    base_name = member.name.split('/')[-1] if '/' in member.name else member.name
+                    if base_name in needed_files:
+                        members_dict[member.name] = member
+
+                # Track what we successfully process
+                batch_successful_ids = []                
                 # Optimize chunk size for RAID stripe alignment
-                chunk_size = max(20, len(batch) // (self.cfg.io_workers * 2))
+                chunk_size = max(50, len(batch) // self.cfg.io_workers)
                 chunks = [batch[i:i+chunk_size] for i in range(0, len(batch), chunk_size)]
                 
-                with ThreadPoolExecutor(max_workers=min(8, self.cfg.io_workers)) as io_pool:
+                with ThreadPoolExecutor(max_workers=min(4, len(chunks))) as io_pool:
                     futures = []
                     
                     for chunk in chunks:
@@ -668,19 +908,20 @@ class ParallelTarProcessor:
                     for future in as_completed(futures):
                         try:
                             ids = future.result()
-                            successful_ids.extend(ids)
+                            batch_successful_ids.extend(ids)
                         except Exception as e:
                             logging.error(f"Chunk extraction failed: {e}")
-                
+
+                # Only mark as successful after all chunks complete
+                successful_ids.extend(batch_successful_ids)
+
             finally:
                 tar.close()
                 
         except Exception as e:
             logging.error(f"Failed to process tar {tar_path}: {e}")
         
-        # Mark completed
-        for image_id in successful_ids:
-            self.progress_tracker.mark_completed(image_id)
+        # Mark completed AFTER successful extraction
         
         return successful_ids
     
@@ -688,6 +929,7 @@ class ParallelTarProcessor:
                       chunk: List[Tuple[int, str, Path, Dict]]) -> List[int]:
         """Extract a chunk of files from tar."""
         successful_ids = []
+        buffer_size = min(self.cfg.write_buffer_size_mb, 64) * 1024 * 1024  # Cap buffer size
         
         for image_id, filename, dest_path, row_data in chunk:
             try:
@@ -701,92 +943,98 @@ class ParallelTarProcessor:
                             break
                 
                 if not member:
+                    logging.debug(f"Member {filename} not found in tar")
                     continue
                 
-                # Direct extraction without temp directory
+                # Extract file data
                 try:
-                    # Extract file data directly
+                    start_write = time.time()
                     file_obj = tar.extractfile(member)
                     if file_obj:
-                        # Read with large buffer
                         data = file_obj.read()
+                        file_obj.close()
                         
-                        # Write directly to destination with aligned buffer
-                        self._optimized_write(dest_path, data)
+                        # Direct synchronous write with large buffer
+                        try:
+                            temp_path = dest_path.with_suffix('.tmp')
+                            with open(temp_path, 'wb', buffering=buffer_size) as f:
+                                f.write(data)
+                                # Only fsync if explicitly enabled (usually disabled for speed)
+                                if self.cfg.enable_fsync:
+                                    f.flush()
+                                    os.fsync(f.fileno())
+                            temp_path.replace(dest_path)
+                            # Track write statistics
+                            with self.stats_lock:
+                                self.stats['total_bytes_written'] += len(data)
+                                self.stats['write_time'] += (time.time() - start_write)
+
+                        except Exception as e:
+                            logging.error(f"Failed to write {dest_path}: {e}")
+                            if temp_path.exists():
+                                temp_path.unlink()
+                            continue
                         
                         # Write JSON if needed
                         if self.cfg.per_image_json and self.json_writer:
                             json_path = dest_path.parent / f"{image_id}.json"
                             json_data = prepare_json_data(row_data, self.cfg)
                             self.json_writer.add_write(json_path, json_data)
-                        
+
+                        # Only mark successful AFTER write completes
+                        self.progress_tracker.mark_completed(image_id)                       
                         successful_ids.append(image_id)
-                        file_obj.close()
+
                     
                 except Exception as e:
                     logging.debug(f"Direct extraction failed for {filename}: {e}")
-                    # Fall back to temp directory method if direct fails
-                    with TemporaryDirectory() as tmpdir:
-                        tar.extract(member, tmpdir)
-                        extracted_path = Path(tmpdir) / member.name
-                        self._optimized_copy(extracted_path, dest_path)
-                    
-                        successful_ids.append(image_id)
+
                     
             except Exception as e:
                 logging.debug(f"Failed to extract {filename}: {e}")
         
         return successful_ids
 
-    def _optimized_write(self, dst: Path, data: bytes):
-        """Optimized direct write for RAID 0 with stripe alignment."""
-        buffer_size = self.cfg.write_buffer_size_mb * 1024 * 1024
-        
-        # Align write size to RAID stripe size
-        stripe_size = self.cfg.stripe_size_kb * 1024
-        if len(data) > stripe_size:
-            # Pad to stripe boundary for optimal RAID 0 performance
-            padding = (stripe_size - (len(data) % stripe_size)) % stripe_size
-            if padding and padding < 4096:  # Only pad if small
-                data = data + b'\0' * padding
-        
-        with open(dst, 'wb', buffering=buffer_size) as fdst:
-            fdst.write(data)    
-
-    def _optimized_copy(self, src: Path, dst: Path):
-        """Optimized file copy for RAID with large buffers."""
-        buffer_size = self.cfg.write_buffer_size_mb * 1024 * 1024
-
-        # Use sendfile if available (zero-copy on Linux)
-        if hasattr(os, 'sendfile'):
-            try:
-                with open(src, 'rb') as fsrc:
-                    with open(dst, 'wb') as fdst:
-                        sent = 0
-                        file_size = os.fstat(fsrc.fileno()).st_size
-                        while sent < file_size:
-                            sent += os.sendfile(fdst.fileno(), fsrc.fileno(), sent, file_size - sent)
-                return
-            except:
-                pass  # Fall back to regular copy
-
-        with open(src, 'rb', buffering=buffer_size) as fsrc:
-            with open(dst, 'wb', buffering=buffer_size) as fdst:
-                shutil.copyfileobj(fsrc, fdst, length=buffer_size)
     
     def finish_remaining(self):
         """Process all remaining batches."""
         logging.info(f"⏳ Processing {len(self.tar_batches)} remaining tar batches...")
         
-        # Submit all remaining batches
+        # Submit remaining batches in controlled manner
         with self.tar_lock:
-            for tar_name in list(self.tar_batches.keys()):
-                if self.tar_batches[tar_name] and tar_name not in self.active_tars:
-                    self._submit_tar_extraction(tar_name)
+            remaining = [(name, len(batch)) for name, batch in self.tar_batches.items() if batch]
+            logging.info(f"📦 Remaining batches: {remaining}")
+            
+            # Process in smaller groups to control memory
+            tar_names = list(self.tar_batches.keys())
+            for i in range(0, len(tar_names), self.cfg.concurrent_tar_limit):
+                group = tar_names[i:i+self.cfg.concurrent_tar_limit]
+                
+                for tar_name in group:
+                    if self.tar_batches[tar_name] and tar_name not in self.active_tars:
+                        self._submit_tar_extraction(tar_name)
+                
+                # Wait for this group to complete before starting next
+                wait_start = time.time()
+                while True:
+                    with self.tar_lock:
+                        if len(self.active_tars) == 0:
+                            break
+                    
+                    # Add timeout to prevent infinite wait
+                    if time.time() - wait_start > 600:  # 10 minute timeout
+                        logging.error("⚠️ Timeout waiting for tar extraction, proceeding...")
+                        break
+
+                    time.sleep(0.5)
+                    self._cleanup_completed_futures()
         
         # Wait for all to complete
         self.extract_executor.shutdown(wait=True)
-        self.io_executor.shutdown(wait=True)
+
+        
+        # Clean up cache
+        logging.info("🧹 Cleaning up memory cache...")
         self.cache_manager.close()
     
     def get_stats(self) -> Dict[str, int]:
@@ -831,12 +1079,20 @@ class ProgressReporter:
             # Memory usage
             process = psutil.Process()
             mem_usage = process.memory_info().rss / 1024**3  # GB
+
+            # Write throughput (only bytes, not mixed units)
+            write_mb = stats.get('total_bytes_written', 0) / (1024 * 1024)
+            write_time = stats.get('write_time', 0.1)  # Avoid divide by zero
+            write_throughput = write_mb / write_time if write_time > 0 else 0            
             
+            # Use consistent units (images/s for rate, MB/s for write)
             logging.info(
                 f"📊 Progress: {stats['extracted']:,} extracted, "
                 f"{stats['failed']:,} failed, {stats['skipped']:,} skipped, "
                 f"{stats['not_found']:,} not found | "
-                f"Rate: {rate:.1f}/s | Memory: {mem_usage:.1f}GB | "
+                f"Rate: {rate:.1f} img/s | Memory: {mem_usage:.1f}GB | "
+                f"Write: {write_throughput:.1f} MB/s | "
+                f"Total written: {write_mb:.1f}MB | "
                 f"Time: {elapsed/60:.1f}min"
             )
             
@@ -884,7 +1140,7 @@ def prepare_json_data(row: Dict[str, Any], cfg: Config) -> Dict[str, Any]:
     if ext not in [".jpg", ".jpeg", ".png", ".webp", ".gif"]:
         ext = ".jpg"
     
-    image_id = row[cfg.id_col]
+    image_id = row[cfg.id_col]  # Use id column to match actual file names
     filename = f"{image_id}{ext}"
     
     rating_raw = str(row.get(cfg.rating_col, "")).strip().lower()
@@ -952,10 +1208,20 @@ def process_extractions_optimized(metadata_stream: Iterator[Dict[str, Any]],
     
     try:
         # Process metadata stream
+        batch_count = 0
         for row in metadata_stream:
             if stop_handler and stop_handler.should_stop():
                 logging.info("🛑 Stopping extraction due to user interrupt...")
                 break
+
+            # Add periodic memory check and pause
+            batch_count += 1
+            if batch_count % 100 == 0:  # Check more frequently
+                is_paused, mem_gb = processor.memory_monitor.check_memory()
+                if is_paused:
+                    logging.info(f"⏸️ Pausing new additions due to memory ({mem_gb:.1f}GB)...")
+                    time.sleep(1)  # Give system time to process pending work
+            
             
             processor.process_row(row)
             
@@ -1006,12 +1272,16 @@ def build_polars_filter_expr(cfg: Config) -> pl.Expr:
     filters = []
     
     # File type filtering
-    if cfg.exclude_gifs and cfg.file_path_col:
-        filters.append(~pl.col(cfg.file_path_col).str.ends_with('.gif'))
+    if cfg.file_path_col:
+        # Handle nulls properly
+        file_col = pl.col(cfg.file_path_col).fill_null("")
+        
+        if cfg.exclude_gifs:
+            filters.append(~file_col.str.ends_with('.gif'))
     
-    excluded_extensions = ('.zip', '.mp4', '.webm', '.swf')
-    for ext in excluded_extensions:
-        filters.append(~pl.col(cfg.file_path_col).str.ends_with(ext))
+        excluded_extensions = ('.zip', '.mp4', '.webm', '.swf')
+        for ext in excluded_extensions:
+            filters.append(~file_col.str.ends_with(ext))
     
     # Tag filtering (using Polars expressions)
     if cfg.enable_include_tags and cfg.include_tags:
@@ -1167,11 +1437,11 @@ def stream_filtered_metadata(path: Path, cfg: Config, stop_handler: Optional[Sof
     # Apply transformations while still lazy
     numeric_cols = [c for c in (cfg.width_col, cfg.height_col, cfg.score_col) if c in final_cols]
     for col in numeric_cols:
+    # Handle numeric columns more carefully
         lf = lf.with_columns(
             pl.col(col)
-              .cast(pl.Float64, strict=False)
-              .fill_null(0)
-              .cast(pl.Int64)
+              .cast(pl.Int64, strict=False)  # Try direct int cast first
+              .fill_null(-1 if col == cfg.score_col else 0)  # Use -1 for score to distinguish from actual 0
         )
     
     # Normalize tag columns - MUST normalize all columns used for filtering
@@ -1296,7 +1566,7 @@ def build_cli() -> argparse.ArgumentParser:
     p.add_argument("--no-extract", dest="extract", action="store_false", help="Skip extraction")
     p.add_argument("--no-json", dest="json", action="store_false", help="Don't write JSON metadata")
     p.add_argument("--dry-run", action="store_true", help="Show matches without extracting")
-    p.add_argument("--exclude-gifs", action="store_true", help="Exclude .gif files")
+    p.add_argument("--include-gifs", action="store_true", help="Include .gif files (excluded by default)")
     p.add_argument("--no-validate", dest="validate", action="store_false", help="Skip validation")
     p.add_argument("--full-scan", action="store_true", help="Perform full filesystem scan")
     p.add_argument("--rebuild-index", action="store_true", help="Rebuild tar index")
@@ -1388,8 +1658,8 @@ def apply_cli_overrides(args: argparse.Namespace, cfg: Config) -> None:
     if args.dry_run:
         cfg.dry_run = True
         cfg.extract_images = False
-    if args.exclude_gifs:
-        cfg.exclude_gifs = True
+    if args.include_gifs:
+        cfg.exclude_gifs = False  # Include GIFs when flag is set
     if hasattr(args, 'validate') and not args.validate:
         cfg.validate_on_start = False
     if args.full_scan:
@@ -1415,388 +1685,142 @@ class TarIndex:
     
     def __init__(self, source_dir: Path, rebuild: bool = False):
         self.source_dir = source_dir
-        self.index = {}  # {image_id: (tar_name, filename_in_tar)}
-        self.tar_contents = {}  # {tar_name: set(filenames)}
-        self.tar_patterns = {}  # {tar_name: pattern_info}
-        self.index_file = source_dir / ".tar_index_cache.json"
+        self.index = {}  # {file_id: tar_name}
         self.lock = threading.Lock()
         
-        if not rebuild and self.index_file.exists():
-            self._load_index()
+        # Use the existing cache that's already built
+        cache_file = source_dir / ".tar_index_cache.json"
+        
+        if cache_file.exists() and not rebuild:
+            self._load_existing_cache(cache_file)
         else:
-            self._build_index()
-            self._save_index()
+            logging.error("❌ No existing cache found. Building new index...")
+            self._build_from_json_files()
     
-    def _load_index(self):
-        """Load cached index from file."""
+    def _load_existing_cache(self, cache_file: Path):
+        """Load the existing tar_index_cache.json."""
         try:
-            logging.info("📚 Loading cached tar index...")
-            with open(self.index_file, 'r') as f:
+            logging.info("📚 Loading existing tar index cache...")
+            with open(cache_file, 'r') as f:
                 data = json.load(f)
-                # Convert string keys back to integers
-                self.index = {int(k): tuple(v) for k, v in data.get('index', {}).items()}
-                self.tar_contents = data.get('tar_contents', {})
-                self.tar_patterns = data.get('tar_patterns', {})
-                self.id_mapping = data.get('id_mapping', {})  # Add ID mapping
-                self.metadata_to_tar_id = {int(k): v for k, v in data.get('metadata_to_tar_id', {}).items()}
-            logging.info(f"✅ Loaded index with {len(self.index):,} images from {len(self.tar_contents)} tar files")
-        except Exception as e:
-            logging.warning(f"⚠️ Failed to load index cache: {e}")
-            logging.info("📚 Rebuilding index from scratch...")
-            self._build_index()
-            self._save_index()
-    
-    def _save_index(self):
-        """Save index to cache file."""
-        try:
-            # Convert integer keys to strings for JSON serialization
-            data = {
-                'index': {str(k): v for k, v in self.index.items()},
-                'tar_contents': self.tar_contents,
-                'tar_patterns': self.tar_patterns,
-                'id_mapping': getattr(self, 'id_mapping', {}),  # Save ID mapping
-                'metadata_to_tar_id': {str(k): v for k, v in self.metadata_to_tar_id.items()},
-                'last_updated': time.time()
-            }
-            
-            tmp_file = self.index_file.with_suffix('.tmp')
-            with open(tmp_file, 'w') as f:
-                json.dump(data, f)
-            tmp_file.replace(self.index_file)
-            logging.info(f"💾 Saved tar index cache with {len(self.index):,} entries")
-        except Exception as e:
-            logging.error(f"Failed to save index cache: {e}")
+            # The cache has 'image_to_tar' mapping
+            if 'image_to_tar' in data:
+                image_to_tar = data['image_to_tar']
+                
+                # Process the mappings
+                for key, tar_name in image_to_tar.items():
+                    # Key might be like "8349000.png" or "8349000"
+                    # Extract just the numeric ID
+                    if '.' in key:
+                        # Remove extension
+                        file_id_str = key.split('.')[0]
+                    else:
+                        file_id_str = key
+                    
+                    try:
+                        file_id = int(file_id_str)
+                        self.index[file_id] = tar_name
+                    except ValueError:
+                        continue
+                
+                logging.info(f"✅ Loaded {len(self.index):,} file ID mappings from existing cache")
+                
+                # Show sample mappings
+                samples = list(self.index.items())[:5]
+                for fid, tar in samples:
+                    logging.info(f"  File ID {fid} -> {tar}")
 
-    def _detect_tar_pattern(self, tar_name: str) -> Dict[str, Any]:
-        """Detect the ID range or pattern for a tar file."""
-        pattern_info = {}
-        
-        # Try to extract ID range from tar filename
-        # Common patterns: 
-        # - "images_0000000-0999999.tar"
-        # - "danbooru2024_000000_000999.tar"
-        # - "0000000-0999999.tar"
-        # - Simple numbered: "001.tar", "002.tar"
-        
-        # Pattern 1: Range in filename (e.g., "0000000-0999999")
-        range_match = re.search(r'(\d{6,})[_-](\d{6,})', tar_name)
-        if range_match:
-            pattern_info['start_id'] = int(range_match.group(1))
-            pattern_info['end_id'] = int(range_match.group(2))
-            pattern_info['type'] = 'range'
-            return pattern_info
-        
-        # Pattern 2: Sequential number (e.g., "001.tar", "batch_001.tar")
-        seq_match = re.search(r'(\d{3,})', tar_name)
-        if seq_match:
-            seq_num = int(seq_match.group(1))
-            # Assume each tar contains 1 million images (adjust as needed)
-            images_per_tar = 1000000
-            pattern_info['start_id'] = seq_num * images_per_tar
-            pattern_info['end_id'] = (seq_num + 1) * images_per_tar - 1
-            pattern_info['type'] = 'sequential'
-            return pattern_info
-        
-        pattern_info['type'] = 'unknown'
-        return pattern_info
+                # Log total unique tar files
+                unique_tars = len(set(self.index.values()))
+                logging.info(f"  Unique tar files referenced: {unique_tars}")
+
+        except Exception as e:
+            logging.error(f"Failed to load cache: {e}")
+            self._build_from_json_files()
     
-    
-    def _build_index(self):
-        """Build the tar index by scanning tar files."""
-        logging.info("📚 Building tar index...")
+    def _build_from_json_files(self):
+        """Build index from the JSON files next to tar files."""
+        logging.info("📚 Building index from JSON files...")
         
         tar_files = sorted(self.source_dir.glob("*.tar"))
         if not tar_files:
             logging.warning(f"⚠️ No tar files found in {self.source_dir}")
             return
         
-        logging.info(f"Found {len(tar_files)} tar files to index")
-
-        # Try to detect ID mapping pattern
-        self.id_mapping = {}
-        sample_tar = tar_files[0] if tar_files else None
-        if sample_tar:
-            try:
-                # Read first tar to understand ID pattern
-                with tarfile.open(sample_tar, 'r') as tar:
-                    first_members = []
-                    for member in tar:
-                        if member.isfile() and len(first_members) < 100:
-                            first_members.append(member.name)
-                    
-                    # Extract IDs and detect pattern
-                    ids_found = []
-                    for name in first_members:
-                        match = re.search(r'(\d+)\.(jpg|jpeg|png|gif|webp)', name, re.IGNORECASE)
-                        if match:
-                            ids_found.append(int(match.group(1)))
-                    
-                    if ids_found:
-                        min_id = min(ids_found)
-                        max_id = max(ids_found)
-                        logging.info(f"📊 Detected ID range in tars: {min_id:,} - {max_id:,}")
-                        # Store this for later use
-                        self.tar_id_offset = min_id // 1000000 * 1000000  # Round down to millions
-                        logging.info(f"📊 Estimated tar ID offset: {self.tar_id_offset:,}")
-            except Exception as e:
-                logging.debug(f"Could not detect ID pattern: {e}")
-                self.tar_id_offset = 0
-
-        # First, try to understand the tar organization
-        for tar_path in tar_files[:5]:  # Sample first 5 tars
-            tar_name = tar_path.name
-
-            # Store pattern info
-            if tar_name not in self.tar_patterns:
-                self.tar_patterns[tar_name] = self._detect_tar_pattern(tar_name)
-
-            pattern = self._detect_tar_pattern(tar_name)
-            self.tar_patterns[tar_name] = pattern
-            logging.debug(f"Tar {tar_name} pattern: {pattern}")
-
-        for tar_path in tqdm(tar_files, desc="Indexing tar files"):
+        # Process each tar's JSON file
+        for tar_path in tar_files:  # Process all tar files, not just first 100
             tar_name = tar_path.name
             json_path = tar_path.with_suffix('.json')
             
             if not json_path.exists():
-                # Read tar contents directly - but more efficiently
-                logging.info(f"📖 Reading {tar_name} directly (no JSON found)...")
-                self._index_tar_directly_fast(tar_path)
+                logging.warning(f"No JSON for {tar_name}")
                 continue
             
             try:
-                # Read the JSON metadata
                 with open(json_path, 'r') as f:
-                    metadata = json.load(f)
                
+                    data = json.load(f)
 
-                # Handle the actual JSON structure from danbooru2024
-                files = []
-                if isinstance(metadata, dict):
-                    # The JSON has 'files' key with list of dictionaries
-                    files_data = metadata.get('files', [])
-                    if isinstance(files_data, list):
-                        # Each item in files_data is a dict with 'filename' and 'id'
-                        for item in files_data:
-                            if isinstance(item, dict):
-                                # Extract both filename and metadata ID
-                                filename = item.get('filename', item.get('name', ''))
-                                metadata_id = item.get('id')  # This is the metadata row ID
-                                if filename:
-                                    files.append({'filename': filename, 'metadata_id': metadata_id})
-                            elif isinstance(item, str):
-                                files.append({'filename': item, 'metadata_id': None})
-
-                    elif isinstance(files_data, dict):
-                        # If it's a dict, try to get values
-                        for key, value in files_data.items():
-                            if isinstance(value, str):
-                                files.append({'filename': value, 'metadata_id': None})
-                            elif isinstance(value, dict):
-                                files.append(value)
-                    else:
-                        logging.warning(f"Unexpected 'files' type in {tar_name}: {type(files_data)}")
-                        # Fall back to direct tar reading
-                        self._index_tar_directly_fast(tar_path)
-                        continue
-                elif isinstance(metadata, list):
-                    files = metadata
                 
-                if not files:
-                    logging.warning(f"No files found in JSON for {tar_name}, reading tar directly")
-                    self._index_tar_directly_fast(tar_path)
-                    continue
-                
-                # Process the file list
-                tar_contents = set()
-                indexed_count = 0
-                for entry in files:
-                    if not isinstance(entry, dict):
-                         continue
-                     
-                    filename = entry.get('filename', '')
-                    metadata_id = entry.get('metadata_id')
-                    
-                    if not filename:
-                        continue
-                    
-                    # Extract image ID from filename
-                    # Handle paths like "1234/5678901.jpg" or just "5678901.jpg"
-                    basename = os.path.basename(filename)
-                    match = re.match(r'(\d+)\.(jpg|jpeg|png|gif|webp)', basename, re.IGNORECASE)
-                    if match:
-                        image_id = int(match.group(1))
-
-                        # Store with the actual tar image ID
-                        self.index[image_id] = (tar_name, filename)
-
-                        tar_contents.add(filename)
-                        indexed_count += 1
-                        
-                        # Create mapping from metadata ID to tar ID if we have it
-                        if metadata_id is not None:
-                            self.metadata_to_tar_id[metadata_id] = image_id
-                
-                self.tar_contents[tar_name] = tar_contents
-                if indexed_count > 0:
-                    logging.debug(f"  Indexed {indexed_count} images from {tar_name}")
-                else:
-                    logging.warning(f"  No images indexed from {tar_name} JSON, trying direct read")
-                    self._index_tar_directly_fast(tar_path)
-                
+                if 'files' in data and isinstance(data['files'], dict):
+                    # Process the dictionary entries
+                    for key in data['files'].keys():
+                        # Extract numeric ID from key
+                        file_id_str = key.split('.')[0] if '.' in key else key
+                        try:
+                            file_id = int(file_id_str)
+                            self.index[file_id] = tar_name
+                        except ValueError:
+                            continue
+                                       
             except Exception as e:
                 logging.error(f"Failed to process {json_path}: {e}")
-                # Fall back to reading tar directly
-                self._index_tar_directly_fast(tar_path)
         
-        logging.info(f"✅ Indexed {len(self.index):,} images across {len(self.tar_contents)} tar files")
-
-        # If we found no images, something is wrong
-        if len(self.index) == 0:
-            logging.error("❌ No images found in tar files! Check tar structure.")
-            # Try to debug by reading first tar
-            if tar_files:
-                self._debug_tar_structure(tar_files[0]) 
-
-    def _index_tar_directly_fast(self, tar_path: Path):
-        """Index a tar file by reading just the member list (faster)."""
-        tar_name = tar_path.name
-        try:
-            # Open tar without reading file contents
-            with tarfile.open(tar_path, 'r|') as tar:
-                tar_contents = set()
-                member_count = 0
-                
-                for member in tar:
-                    if member.isfile():
-                        # Handle nested paths
-                        full_path = member.name
-                        basename = os.path.basename(full_path)
-                        
-                        # Try to extract image ID from basename
-                        match = re.match(r'(\d+)\.(jpg|jpeg|png|gif|webp)', basename, re.IGNORECASE)
-                        if match:
-                            image_id = int(match.group(1))
-                            self.index[image_id] = (tar_name, full_path)
-                            tar_contents.add(full_path)
-                            member_count += 1
-
-                            # Try to create ID mapping
-                            if hasattr(self, 'tar_id_offset') and self.tar_id_offset > 0:
-                                possible_metadata_id = image_id - self.tar_id_offset
-                                if 0 < possible_metadata_id < 10000000:
-                                    self.id_mapping[possible_metadata_id] = image_id
-
-                            # Log progress for large tars
-                            if member_count % 10000 == 0:
-                                logging.debug(f"  Indexed {member_count} images from {tar_name}...")
-                
-                self.tar_contents[tar_name] = tar_contents
-                logging.info(f"  ✅ Indexed {member_count} images from {tar_name}")
-                
-        except Exception as e:
-            logging.error(f"Failed to read tar file {tar_path}: {e}")
+        logging.info(f"✅ Built index with {len(self.index):,} file ID mappings")
     
-    def _debug_tar_structure(self, tar_path: Path):
-        """Debug helper to understand tar structure."""
-        logging.info(f"🔍 Debugging tar structure for {tar_path.name}...")
-        try:
-            with tarfile.open(tar_path, 'r') as tar:
-                members = tar.getmembers()[:10]  # First 10 files
-                logging.info(f"  Sample files in tar:")
-                for member in members:
-                    if member.isfile():
-                        logging.info(f"    - {member.name} (size: {member.size})")
-        except Exception as e:
-            logging.error(f"Failed to debug tar: {e}")
-
-    def find_image(self, image_id: int, file_url: str) -> Optional[Tuple[str, str]]:
+    def find_image(self, image_id: int, file_url: str = "") -> Optional[Tuple[str, str]]:
 
         """
-        Find which tar contains an image. Returns (tar_name, filename) or None.
-        The image_id here is the metadata row ID, not the tar file ID.
+         Find which tar contains an image based on image ID.
+        Returns (tar_name, filename) or None.
         """
         with self.lock:
-            # First, map metadata ID to tar ID
-            tar_id = self.metadata_to_tar_id.get(image_id)
+            # Look up the image ID directly
+            tar_name = self.index.get(image_id)
             
-            if tar_id:
-                # Now look up the tar file using the actual tar ID
-                result = self.index.get(tar_id)
-                if result:
-                    return result
+            if tar_name:
+                # Try to get actual extension from tar's JSON first
+                json_path = self.source_dir / tar_name.replace('.tar', '.json')
+                actual_ext = None
+                if json_path.exists():
+                    try:
+                        with open(json_path, 'r') as f:
+                            data = json.load(f)
+                            if 'files' in data and str(image_id) in data['files']:
+                                # Get actual filename from JSON
+                                actual_filename = list(data['files'][str(image_id)].keys())[0]
+                                actual_ext = os.path.splitext(actual_filename)[1]
+                    except:
+                        pass
+                
+                # Fall back to URL extension or default
+                ext = actual_ext or '.jpg'
+                if file_url:
+                    ext_match = re.search(r'\.(jpg|jpeg|png|gif|webp)$', file_url, re.IGNORECASE)
+                    if ext_match:
+                        ext = actual_ext or ext_match.group(0)
+                
+                # Construct the filename as it appears in the tar
+                filename = f"{image_id}{ext}"
+                return (tar_name, filename)
             
-            # Fallback: try extracting ID from file_url if available
-            if file_url:
-                match = re.search(r'/(\d+)\.(jpg|jpeg|png|gif|webp)$', file_url, re.IGNORECASE)
-                if match:
-                    url_id = int(match.group(1))
-                    result = self.index.get(url_id)
-                    if result:
-                        # Cache this mapping for future use
-                        self.metadata_to_tar_id[image_id] = url_id
-                        return result
-            
-            # If still not found, try old fallback methods
-            # Try direct lookup with the image_id as-is (unlikely to work)
-            result = self.index.get(image_id)
-            if result:
-                return result
-            
-            # Try to map metadata ID to tar ID
-            if hasattr(self, 'id_mapping'):
-                tar_id = self.id_mapping.get(image_id)
-                if tar_id:
-                    result = self.index.get(tar_id)
-                    if result:
-                        return result
-            
-            # Try with offset if we detected one
-            if hasattr(self, 'tar_id_offset') and self.tar_id_offset > 0:
-                # Try adding the offset to the metadata ID
-                possible_tar_id = image_id + self.tar_id_offset
-                result = self.index.get(possible_tar_id)
-                if result:
-                    return result
-            
-            # If not in index, try to guess based on tar patterns
-            if self.tar_patterns:
-                for tar_name, pattern in self.tar_patterns.items():
-                    if pattern.get('type') == 'range':
-                        if pattern['start_id'] <= image_id <= pattern['end_id']:
-                            # This tar might contain the image
-                            # Construct expected filename
-                            ext = os.path.splitext(file_url)[1] if file_url else '.jpg'
-                            possible_names = [
-                                f"{image_id}{ext}",
-                                f"{image_id:07d}{ext}",  # Padded
-                                f"{str(image_id)[:4]}/{image_id}{ext}",  # Nested by first 4 digits
-                            ]
-                            
-                            # Check if any of these exist in the tar
-                            tar_contents = self.tar_contents.get(tar_name, set())
-                            for name in possible_names:
-                                if name in tar_contents:
-                                    # Cache this finding
-                                    self.index[image_id] = (tar_name, name)
-                                    return (tar_name, name)
-            
-            # Still not found
             return None
-    
-    def get_tar_contents(self, tar_name: str) -> Set[str]:
-        """Get the set of files in a tar."""
-        return self.tar_contents.get(tar_name, set())
 
     def get_statistics(self) -> Dict[str, Any]:
         """Get index statistics for debugging."""
         stats = {
             'total_images': len(self.index),
-            'total_tars': len(self.tar_contents),
-            'tar_patterns': self.tar_patterns,
-            'id_mapping_size': len(getattr(self, 'id_mapping', {})),
-            'metadata_to_tar_mapping_size': len(self.metadata_to_tar_id),
-            'sample_mappings': dict(list(self.index.items())[:5]) if self.index else {}
+            'sample_mappings': dict(list(self.index.items())[:10]) if self.index else {}
         }
         return stats
 
@@ -1854,10 +1878,14 @@ def main() -> None:
     # Debug: Show index statistics
     index_stats = tar_index.get_statistics()
     logging.info(f"📊 Index statistics:")
-    logging.info(f"   Total indexed images: {index_stats['total_images']:,}")
-    logging.info(f"   Total tar files: {index_stats['total_tars']}")
+    logging.info(f"   Total indexed file IDs: {index_stats['total_images']:,}")
     if index_stats['sample_mappings']:
         logging.info(f"   Sample mappings: {index_stats['sample_mappings']}")
+    
+    # Important note about the ID column
+    logging.info(" NOTE: Using 'id' column as primary identifier")
+    logging.info("   This column contains the actual image IDs that match tar files")
+    logging.info("   Each metadata row describes the image with that row's ID")
      
 
     # Use signal handler for graceful interruption
