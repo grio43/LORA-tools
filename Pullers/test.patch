@@ -1,0 +1,284 @@
+diff --git a/Dambooru2024_local_puller.py b/Dambooru2024_local_puller.py
+index 2911ca6..6d609ee 100644
+--- a/Dambooru2024_local_puller.py
++++ b/Dambooru2024_local_puller.py
+@@ -17,20 +17,79 @@
+ import threading
+ import time
+ import tarfile
+-import shutil
+ import mmap
+-from collections import defaultdict, deque
+-from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
++from collections import defaultdict
++from concurrent.futures import ThreadPoolExecutor, as_completed
+ from dataclasses import dataclass, field
+ from pathlib import Path
+-from typing import List, Optional, Iterator, Dict, Any, Set, Tuple, Deque
+-from tempfile import TemporaryDirectory
++from typing import List, Optional, Iterator, Dict, Any, Set, Tuple
+ from functools import lru_cache
+-import multiprocessing as mp
+ import io
+ 
+ import polars as pl
+-import pandas as pd
+ import psutil
+ 
++# --- Lightweight zero-copy reader for bytes-like buffers or mmap ---
++class _BufferReader(io.RawIOBase):
++    """Minimal file-like wrapper over a bytes-like object (bytearray, memoryview, mmap).
++    Implements read/readinto/seek/tell so tarfile can use it without copying.
++    """
++    def __init__(self, buf):
++        self._buf = memoryview(buf)
++        self._pos = 0
++        self._closed = False
++
++    def readable(self):
++        return True
++
++    def seekable(self):
++        return True
++
++    def tell(self):
++        return self._pos
++
++    def seek(self, offset, whence=io.SEEK_SET):
++        if whence == io.SEEK_SET:
++            new = offset
++        elif whence == io.SEEK_CUR:
++            new = self._pos + offset
++        elif whence == io.SEEK_END:
++            new = len(self._buf) + offset
++        else:
++            raise ValueError("invalid whence")
++        if new < 0:
++            raise ValueError("negative seek position")
++        self._pos = int(new)
++        return self._pos
++
++    def readinto(self, b):
++        if self._closed:
++            return 0
++        n = min(len(b), len(self._buf) - self._pos)
++        if n <= 0:
++            return 0
++        mv = self._buf[self._pos:self._pos + n]
++        b[:n] = mv
++        self._pos += n
++        return n
++
++    def read(self, n=-1):
++        if self._closed:
++            return b""
++        if n is None or n < 0:
++            n = len(self._buf) - self._pos
++        n = min(n, len(self._buf) - self._pos)
++        if n <= 0:
++            return b""
++        start = self._pos
++        self._pos += n
++        return bytes(self._buf[start:self._pos])
++
++    def close(self):
++        self._closed = True
++        try:
++            self._buf.release()
++        except Exception:
++            pass
++
+ # ---------------------------------------------------------------------------
+ # Optimized Configuration for RAID
+ # ---------------------------------------------------------------------------
+@@ -318,7 +377,7 @@ class ValidatingProgressTracker:
+     """Tracks extraction progress with validation and persistent records."""
+     
+-    def __init__(self, progress_file: Path, update_interval: int = 1000):
++    def __init__(self, progress_file: Path, update_interval: int = 1000, enable_fsync: bool = False):
+         self.progress_file = progress_file
+         self.update_interval = update_interval
+         self.completed_ids: Set[int] = set()
+@@ -329,6 +388,7 @@ class ValidatingProgressTracker:
+         self.update_counter = 0
+         self.lock = threading.Lock()
+         self._load_progress()
++        self.enable_fsync = enable_fsync
+     
+     def _load_progress(self):
+         """Load existing progress from file."""
+@@ -520,7 +580,7 @@ class MemoryCacheManager:
+     def __init__(self, max_size_gb: int = 20, read_buffer_size_mb: int = 256, use_memory_mapping: bool = False,
+                  large_tar_threshold_gb: int = 8, large_tars_policy: str = "mmap"):
+         self.max_size_bytes = max_size_gb * 1024 * 1024 * 1024
+         self.read_buffer_size_mb = read_buffer_size_mb
+-        self.cache: Dict[str, bytes] = {}
++        self.cache: Dict[str, bytearray] = {}
+         self.cache_sizes: Dict[str, int] = {}
+         self.access_times: Dict[str, float] = {}
+         self.total_size = 0
+@@ -448,9 +508,7 @@ class MemoryCacheManager:
+                     if tar_path is None:
+                         time.sleep(0.1)
+                         continue
+-                    
+-                    if tar_path is None:
+-                        break
++
+                     self._load_tar_to_cache(tar_path)
+ 
+                 except Exception as e:
+@@ -610,12 +668,15 @@ class MemoryCacheManager:
+                     data_ba.extend(chunk)
+-            data = bytes(data_ba)
+-            
+-            with self.lock:
+-                self.cache[tar_name] = data
++            # Keep as bytearray to avoid an extra copy; we will wrap with _BufferReader when opening
++            data = data_ba
++            
++            with self.lock:
++                self.cache[tar_name] = data
+                 self.cache_sizes[tar_name] = file_size
+                 self.access_times[tar_name] = time.time()
+                 self.total_size += file_size
+                 event = self.loading_tars.pop(tar_name, None)
+                 if event:
+                     event.set()  # Signal waiting threads
+@@ -639,39 +700,46 @@ class MemoryCacheManager:
+         
+         logging.debug(f"Evicted {tar_name} from cache")
+     
+-    def get_tar_handle(self, tar_path: Path) -> Optional[tarfile.TarFile]:
+-        """Get tar file handle, preferring cached version."""
+-        tar_name = tar_path.name
+-        
+-        # Try to get from cache
+-        with self.lock:
+-            if tar_name in self.cache:
+-                self.access_times[tar_name] = time.time()
+-                data = self.cache[tar_name]
+-                return tarfile.open(fileobj=io.BytesIO(data), mode='r')
+-
+-        # Try memory mapped version
+-        if self.use_memory_mapping:
+-            with self.lock:
+-                if tar_name in self.mmap_handles:
+-                    self.access_times[tar_name] = time.time()
+-                    # Use mmap directly without copying to BytesIO
+-                    return tarfile.open(fileobj=self.mmap_handles[tar_name], mode='r')
+-         
+-        # Load into cache if possible
+-        data = self._load_tar_to_cache(tar_path)
+-        if self.use_memory_mapping:
+-            with self.lock:
+-                if tar_name in self.mmap_handles:
+-                    self.access_times[tar_name] = time.time()
+-                    return tarfile.open(fileobj=self.mmap_handles[tar_name], mode='r')
+-        if data:
+-            return tarfile.open(fileobj=io.BytesIO(data), mode='r')
+-        
+-        # Fall back to direct file access with large buffer
+-        return tarfile.open(tar_path, 'r')
++    def get_tar_handle(self, tar_path: Path) -> Optional[tarfile.TarFile]:
++        """Get a tar file handle, preferring cached or memory-mapped data.
++        Always returns a *fresh* TarFile instance to avoid shared state.
++        """
++        tar_name = tar_path.name
++        
++        # Try to get from cache (bytearray)
++        with self.lock:
++            if tar_name in self.cache:
++                self.access_times[tar_name] = time.time()
++                data = self.cache[tar_name]
++                return tarfile.open(fileobj=io.BufferedReader(_BufferReader(memoryview(data))), mode='r')
++
++        # Try memory mapped version
++        if self.use_memory_mapping:
++            with self.lock:
++                if tar_name in self.mmap_handles:
++                    self.access_times[tar_name] = time.time()
++                    mm = self.mmap_handles[tar_name]
++                    return tarfile.open(fileobj=io.BufferedReader(_BufferReader(mm)), mode='r')
++        
++        # Load into cache if possible (may establish mmap per policy)
++        data = self._load_tar_to_cache(tar_path)
++        if self.use_memory_mapping:
++            with self.lock:
++                if tar_name in self.mmap_handles:
++                    self.access_times[tar_name] = time.time()
++                    mm = self.mmap_handles[tar_name]
++                    return tarfile.open(fileobj=io.BufferedReader(_BufferReader(mm)), mode='r')
++        if data:
++            with self.lock:
++                data = self.cache.get(tar_name, data)
++            return tarfile.open(fileobj=io.BufferedReader(_BufferReader(memoryview(data))), mode='r')
++        
++        # Fall back to direct file access with large buffer
++        return tarfile.open(tar_path, 'r')
+     
+     def prefetch(self, tar_paths: List[Path], priority: bool = False):
+         """Queue tar files for prefetching."""
+         for path in tar_paths:
+             if path.name not in self.cache and path.name not in self.mmap_handles:
+                 with self.prefetch_lock:
+@@ -867,6 +935,9 @@ class ParallelTarProcessor:
+                 for member in tar.getmembers():
+                     base_name = member.name.rsplit('/', 1)[-1]
+                     if base_name in needed_files:
+                         members_dict[base_name].append(member)
+ 
+-                # Track what we successfully process
+-                batch_successful_ids = []                
++                # Track what we successfully process
++                # Create a lock so concurrent extractfile() calls don't share state
++                tar_io_lock = threading.Lock()
++                batch_successful_ids = []                
+                 # Optimize chunk size for RAID stripe alignment
+                 chunk_size = max(50, len(batch) // self.cfg.io_workers)
+                 chunks = [batch[i:i+chunk_size] for i in range(0, len(batch), chunk_size)]
+@@ -878,7 +949,7 @@ class ParallelTarProcessor:
+                     
+                     for chunk in chunks:
+                         future = io_pool.submit(
+                             self._extract_chunk,
+-                            tar, members_dict, chunk
++                            tar, members_dict, chunk, tar_io_lock
+                         )
+                         futures.append(future)
+                     
+@@ -910,8 +981,10 @@ class ParallelTarProcessor:
+     def _extract_chunk(self, tar: tarfile.TarFile, members_dict: Dict[str, Any],
+-                      chunk: List[Tuple[int, str, Path, Dict]]) -> List[int]:
+-        """Extract a chunk of files from tar."""
++                      chunk: List[Tuple[int, str, Path, Dict]], tar_io_lock: threading.Lock) -> List[int]:
++        """Extract a chunk of files from tar.
++        Access to tar is guarded by a lock because TarFile is not thread-safe.
++        """
+         successful_ids = []
+         buffer_size = min(self.cfg.write_buffer_size_mb, 64) * 1024 * 1024  # Cap buffer size
+         
+@@ -953,10 +1026,12 @@ class ParallelTarProcessor:
+                 try:
+                     start_write = time.time()
+-                    file_obj = tar.extractfile(member)
+-                    if file_obj:
+-                        data = file_obj.read()
+-                        file_obj.close()
++                    with tar_io_lock:
++                        file_obj = tar.extractfile(member)
++                        if file_obj:
++                            data = file_obj.read()
++                            file_obj.close()
+                         
+                         # Direct synchronous write with large buffer
+                         try:
+@@ -1248,7 +1323,7 @@ def process_extractions_optimized(metadata_stream: Iterator[Dict[str, Any]], 
+     sharding = DirectorySharding(dest_dir, cfg.files_per_shard)
+     json_writer = BatchedJSONWriter(flush_interval=cfg.json_flush_interval, batch_size=1000, enable_fsync=cfg.enable_fsync) if cfg.per_image_json else None
+-    progress_tracker = ValidatingProgressTracker(dest_dir / "progress.json", update_interval=1000)
++    progress_tracker = ValidatingProgressTracker(dest_dir / "progress.json", update_interval=1000, enable_fsync=cfg.enable_fsync)
+     
+     # Validation
+     if cfg.validate_on_start:
+ 
