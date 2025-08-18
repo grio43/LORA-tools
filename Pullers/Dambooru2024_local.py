@@ -131,17 +131,155 @@ class Config:
 # ---------------------------------------------------------------------------
 # Directory Sharding
 # ---------------------------------------------------------------------------
-class DirectorySharding:
-    """Manages single-level directory sharding for O(1) lookups."""
-    
-    def __init__(self, base_dir: Path, files_per_dir: int = 5000):
+class ShardManifest:
+    """Manages shard state and ID-to-shard mappings for count-based sharding."""
+
+    def __init__(self, base_dir: Path, files_per_shard: int = 5000):
         self.base_dir = base_dir
-        self.files_per_dir = files_per_dir
+        self.files_per_shard = files_per_shard
+        self.manifest_file = base_dir / ".shard_manifest.json"
+        self.lock = threading.Lock()
+        # State tracking
+        self.current_shard_index = 0
+        self.current_shard_count = 0  # Image count in current shard (excludes JSONs)
+        self.id_to_shard: Dict[int, int] = {}
+        self.shard_counts: Dict[int, int] = {}
+        self._load_manifest()
+
+    def _load_manifest(self) -> None:
+        """Load existing manifest or initialize new one."""
+        if self.manifest_file.exists():
+            try:
+                with open(self.manifest_file, 'r') as f:
+                    data = json.load(f)
+                self.current_shard_index = data.get('current_shard_index', 0)
+                self.current_shard_count = data.get('current_shard_count', 0)
+                # Convert string keys back to integers
+                self.id_to_shard = {int(k): v for k, v in data.get('id_to_shard', {}).items()}
+                self.shard_counts = {int(k): v for k, v in data.get('shard_counts', {}).items()}
+                logging.info(f"📂 Loaded shard manifest: {len(self.id_to_shard):,} mappings across {len(self.shard_counts)} shards")
+            except Exception as e:
+                logging.warning(f"⚠️ Failed to load shard manifest: {e}, starting fresh")
+                self._initialize_from_filesystem()
+        else:
+            self._initialize_from_filesystem()
+
+    def _initialize_from_filesystem(self) -> None:
+        """Scan filesystem to rebuild manifest from existing shards."""
+        logging.info("🔍 Scanning filesystem to rebuild shard manifest...")
+        for shard_dir in sorted(self.base_dir.iterdir()):
+            if not shard_dir.is_dir() or not shard_dir.name.startswith("shard_"):
+                continue
+            try:
+                shard_index = int(shard_dir.name.replace("shard_", ""))
+                image_count = 0
+                for file_path in shard_dir.iterdir():
+                    if file_path.is_file() and file_path.suffix.lower() in ['.jpg', '.jpeg', '.png', '.gif', '.webp']:
+                        stem = file_path.stem
+                        if stem.isdigit():
+                            image_id = int(stem)
+                            self.id_to_shard[image_id] = shard_index
+                            image_count += 1
+                if image_count > 0:
+                    self.shard_counts[shard_index] = image_count
+                    self.current_shard_index = max(self.current_shard_index, shard_index)
+            except (ValueError, OSError) as e:
+                logging.debug(f"Skipping invalid shard dir {shard_dir.name}: {e}")
+        # Set current shard count from the highest indexed shard
+        if self.shard_counts:
+            self.current_shard_count = self.shard_counts.get(self.current_shard_index, 0)
+        logging.info(f"📂 Found {len(self.id_to_shard):,} existing files across {len(self.shard_counts)} shards")
+        self._save_manifest()
+
+    def get_shard_for_new_file(self, image_id: int) -> int:
+        """Get shard index for a new file, creating new shard if needed."""
+        with self.lock:
+            if image_id in self.id_to_shard:
+                return self.id_to_shard[image_id]
+            if self.current_shard_count >= self.files_per_shard:
+                self.current_shard_index += 1
+                self.current_shard_count = 0
+                logging.info(f"📁 Creating new shard_{self.current_shard_index:05d} (previous shard full)")
+            shard_index = self.current_shard_index
+            self.id_to_shard[image_id] = shard_index
+            self.current_shard_count += 1
+            self.shard_counts[shard_index] = self.current_shard_count
+            if self.current_shard_count % 100 == 0:
+                self._save_manifest()
+            return shard_index
+
+    def get_shard_for_existing_file(self, image_id: int) -> Optional[int]:
+        """Get shard index for an existing file."""
+        return self.id_to_shard.get(image_id)
+
+    def _save_manifest(self) -> None:
+        """Save manifest to disk atomically."""
+        tmp_path = self.manifest_file.with_suffix('.tmp')
+        try:
+            data = {
+                'current_shard_index': self.current_shard_index,
+                'current_shard_count': self.current_shard_count,
+                'id_to_shard': {str(k): v for k, v in self.id_to_shard.items()},
+                'shard_counts': {str(k): v for k, v in self.shard_counts.items()},
+                'total_files': len(self.id_to_shard),
+                'total_shards': len(self.shard_counts),
+                'last_updated': time.time()
+            }
+            with open(tmp_path, 'w') as f:
+                json.dump(data, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            tmp_path.replace(self.manifest_file)
+        except Exception as e:
+            logging.error(f"❌ Failed to save shard manifest: {e}")
+            if tmp_path.exists():
+                tmp_path.unlink()
+
+    def save_final(self) -> None:
+        """Force save the manifest."""
+        with self.lock:
+            self._save_manifest()
+
+    def get_statistics(self) -> Dict[str, Any]:
+        """Get current sharding statistics."""
+        with self.lock:
+            return {
+                'total_files': len(self.id_to_shard),
+                'total_shards': len(self.shard_counts),
+                'current_shard': self.current_shard_index,
+                'current_shard_fill': self.current_shard_count,
+                'average_shard_fill': sum(self.shard_counts.values()) / len(self.shard_counts) if self.shard_counts else 0,
+                'min_shard_fill': min(self.shard_counts.values()) if self.shard_counts else 0,
+                'max_shard_fill': max(self.shard_counts.values()) if self.shard_counts else 0
+            }
+class DirectorySharding:
+    """Manages count-based directory sharding with proper state tracking."""
+    
+    def __init__(self, base_dir: Path, files_per_shard: int = 5000, use_count_based_sharding: bool = True):
+        self.base_dir = base_dir
+        self.files_per_shard = files_per_shard
+        self.use_count_based_sharding = use_count_based_sharding
         self.base_dir.mkdir(parents=True, exist_ok=True)
+        if use_count_based_sharding:
+            self.manifest = ShardManifest(base_dir, files_per_shard)
+        else:
+            self.manifest = None
+            logging.info("⚠️ Using legacy ID-based sharding (not recommended for filtered datasets)")
     
     def get_shard_path(self, image_id: int, create: bool = False) -> Path:
-        """Get the shard directory path for a given image ID."""
-        shard_index = image_id // self.files_per_dir
+        """Get the shard directory path for a given image ID.
+
+        Uses count-based sharding if enabled, otherwise falls back to ID-based.
+        """
+        if self.use_count_based_sharding and self.manifest:
+            if create:
+                shard_index = self.manifest.get_shard_for_new_file(image_id)
+            else:
+                shard_index = self.manifest.get_shard_for_existing_file(image_id)
+                if shard_index is None:
+                    shard_index = self.manifest.current_shard_index
+        else:
+            shard_index = image_id // self.files_per_shard
         shard_name = f"shard_{shard_index:05d}"
         shard_path = self.base_dir / shard_name
         if create:
@@ -153,57 +291,116 @@ class DirectorySharding:
         return shard_path
     
     def file_exists(self, image_id: int) -> Tuple[bool, Optional[str]]:
-        """Check if file exists in the specific shard directory."""
-        shard_index = image_id // self.files_per_dir
-        shard_path = self.base_dir / f"shard_{shard_index:05d}"
-        extensions = ['.jpg', '.jpeg', '.png', '.gif', '.webp']
-        for ext in extensions:
+        """Check if file exists, using manifest for count-based sharding."""
+        if self.use_count_based_sharding and self.manifest:
+            shard_index = self.manifest.get_shard_for_existing_file(image_id)
+            if shard_index is None:
+                return False, None
+            shard_path = self.base_dir / f"shard_{shard_index:05d}"
+        else:
+            shard_index = image_id // self.files_per_shard
+            shard_path = self.base_dir / f"shard_{shard_index:05d}"
+        if not shard_path.exists():
+            return False, None
+        for ext in ['.jpg', '.jpeg', '.png', '.gif', '.webp']:
             if (shard_path / f"{image_id}{ext}").exists():
                 return True, ext
         return False, None
 
+    def write_atomic_pair(self, image_id: int, image_data: bytes, json_data: Optional[Dict[str, Any]], file_ext: str, enable_fsync: bool = True) -> bool:
+        """Atomically write an image-JSON pair to the same shard.
+
+        Ensures both files are written together or not at all.
+        Returns True if successful, False otherwise.
+        """
+        shard_path = self.get_shard_path(image_id, create=True)
+        image_path = shard_path / f"{image_id}{file_ext}"
+        json_path = shard_path / f"{image_id}.json" if json_data else None
+        temp_image = image_path.with_suffix(image_path.suffix + '.tmp')
+        temp_json = json_path.with_suffix('.json.tmp') if json_path else None
+        try:
+            with open(temp_image, 'wb') as f:
+                f.write(image_data)
+                f.flush()
+                if enable_fsync:
+                    os.fsync(f.fileno())
+            if json_data and temp_json:
+                with open(temp_json, 'w', encoding='utf-8') as f:
+                    json.dump(json_data, f, ensure_ascii=False, indent=2)
+                    f.flush()
+                    if enable_fsync:
+                        os.fsync(f.fileno())
+            temp_image.replace(image_path)
+            if temp_json and json_path:
+                temp_json.replace(json_path)
+            return True
+        except Exception as e:
+            logging.error(f"❌ Failed to write atomic pair for {image_id}: {e}")
+            if temp_image.exists():
+                temp_image.unlink()
+            if temp_json and temp_json.exists():
+                temp_json.unlink()
+            return False
+
     def verify_file_integrity(
         self,
         image_id: int,
-        expected_md5: Optional[str] = None,
+        expected_md5: Optional[str],
+        verify_size: bool = False,
         expected_size: Optional[int] = None,
+        tolerance: int = 100
     ) -> bool:
-        """Verify file integrity with checksum and size.
+        """Verify file existence and optionally its MD5 and size.
 
-        This method checks if a file for the given image ID exists and performs
-        optional validation against provided MD5 checksum and expected file size.
-        If no MD5 is provided, the method will simply ensure that the file
-        exists and is not suspiciously small. A size threshold of 100 bytes
-        is used to reject obviously incomplete files. When an expected size is
-        supplied, the method will tolerate a difference of up to 100 bytes to
-        account for minor encoding variations.
+        If expected_size is supplied, the method will tolerate a difference of up to `tolerance` bytes.
         """
-        shard_index = image_id // self.files_per_dir
-        shard_path = self.base_dir / f"shard_{shard_index:05d}"
+        # Determine shard path based on manifest or legacy ID-based sharding
+        if self.use_count_based_sharding and self.manifest:
+            shard_index = self.manifest.get_shard_for_existing_file(image_id)
+            if shard_index is None:
+                return False
+            shard_path = self.base_dir / f"shard_{shard_index:05d}"
+        else:
+            shard_index = image_id // self.files_per_shard
+            shard_path = self.base_dir / f"shard_{shard_index:05d}"
         # Search across typical image extensions
         for ext in ['.jpg', '.jpeg', '.png', '.gif', '.webp']:
             file_path = shard_path / f"{image_id}{ext}"
             if file_path.exists():
                 try:
-                    # Basic size sanity check
-                    actual_size = file_path.stat().st_size
-                    if actual_size < 100:
-                        return False
-                    # Validate expected size if provided
-                    if expected_size is not None and abs(actual_size - expected_size) > 100:
-                        return False
+                    # Optionally verify size if requested
+                    if verify_size and expected_size is not None:
+                        actual_size = file_path.stat().st_size
+                        if abs(actual_size - expected_size) > tolerance:
+                            logging.error(f"Size mismatch: expected {expected_size}, got {actual_size}")
+                            return False
                     # Validate MD5 checksum if provided
                     if expected_md5:
                         with open(file_path, 'rb') as f:
                             actual_md5 = hashlib.md5(f.read()).hexdigest()
-                        return actual_md5.lower() == expected_md5.lower()
-                    # No MD5 provided; file passes size validation
+                        if actual_md5.lower() != expected_md5.lower():
+                            logging.error(f"MD5 mismatch: expected {expected_md5}, got {actual_md5}")
+                            return False
+                    else:
+                        # Basic size sanity check if no MD5 provided
+                        if file_path.stat().st_size < 100:
+                            return False
                     return True
                 except Exception:
-                    # Any exception indicates failure
                     return False
         # File not found with any of the known extensions
         return False
+
+    def save_manifest(self) -> None:
+        """Save the shard manifest if using count-based sharding."""
+        if self.use_count_based_sharding and self.manifest:
+            self.manifest.save_final()
+
+    def get_statistics(self) -> Dict[str, Any]:
+        """Get sharding statistics."""
+        if self.use_count_based_sharding and self.manifest:
+            return self.manifest.get_statistics()
+        return {}
 
 # ---------------------------------------------------------------------------
 # Batched JSON Writer
@@ -1160,41 +1357,20 @@ def process_tar_file_streaming(tar_name: str,
                                 actual_md5 = hashlib.md5(data).hexdigest()
                                 if actual_md5.lower() != expected_md5.lower():
                                     raise ValueError(f"MD5 mismatch: expected {expected_md5}, got {actual_md5}")
-                        # Prepare paths for writing
+                        # Prepare JSON data if needed and write atomically
                         start_write = time.time()
                         ext = os.path.splitext(member.name)[1] or '.jpg'
-                        shard_path = sharding.get_shard_path(image_id, create=True)
-                        final_path = shard_path / f"{image_id}{ext}"
-                        temp_path = final_path.with_suffix(final_path.suffix + '.tmp')
-                        # Write with buffer
-                        buffer_mb = min(max(1, cfg.write_buffer_size_mb), 16)
-                        buffer_size_bytes = buffer_mb * 1024 * 1024
-                        with open(temp_path, 'wb', buffering=buffer_size_bytes) as f:
-                            f.write(data)
-                            f.flush()
-                            if cfg.enable_fsync:
-                                os.fsync(f.fileno())
-                        # Verify written size matches data size
-                        written_size = temp_path.stat().st_size
-                        if written_size != len(data):
-                            temp_path.unlink()
-                            raise ValueError(f"Written size mismatch: expected {len(data)}, got {written_size}")
-                        # Atomically replace temp file with final file
-                        temp_path.replace(final_path)
-                        # Final verification after write
-                        if cfg.verify_checksums and not sharding.verify_file_integrity(image_id, row.get(cfg.md5_col) if cfg.md5_col else None):
-                            final_path.unlink()
-                            raise ValueError("Final file verification failed")
+                        json_data = None
+                        if cfg.per_image_json:
+                            json_data = prepare_json_data(row, cfg)
+                        # Write both image and JSON atomically
+                        if not sharding.write_atomic_pair(image_id, data, json_data, ext, cfg.enable_fsync):
+                            raise ValueError("Failed to write image-JSON pair atomically")
                         # Update stats
                         with stats_lock:
                             stats['total_bytes_written'] += len(data)
                             stats['write_time'] += (time.time() - start_write)
                             stats['extracted'] += 1
-                        # Write JSON metadata if enabled
-                        if cfg.per_image_json and json_writer:
-                            json_path = shard_path / f"{image_id}.json"
-                            json_data = prepare_json_data(row, cfg)
-                            json_writer.add_write(json_path, json_data)
                         # Mark as completed
                         progress_tracker.mark_completed(image_id)
                         extracted_count += 1
@@ -1252,10 +1428,11 @@ def process_extractions_by_tar_file(grouped_metadata: Dict[str, List[Dict[str, A
     Each tar file is opened once and all needed files are extracted.
     """
     
-    sharding = DirectorySharding(dest_dir, cfg.files_per_shard)
+    sharding = DirectorySharding(dest_dir, cfg.files_per_shard, use_count_based_sharding=True)
     
     json_writer: Optional[Union[BatchedJSONWriter, AsyncJSONWriter]] = None
-    if cfg.per_image_json:
+    # JSON writing is handled via atomic pair writing; disable standalone writers
+    if cfg.per_image_json and False:
         if cfg.json_writer_workers and cfg.json_writer_workers > 0:
             json_writer = AsyncJSONWriter(workers=cfg.json_writer_workers, enable_fsync=cfg.enable_fsync)
         else:
@@ -1280,16 +1457,23 @@ def process_extractions_by_tar_file(grouped_metadata: Dict[str, List[Dict[str, A
     stats_lock = threading.Lock()
     
     progress_reporter = ProgressReporter(interval=10.0)
-    
+
     if stop_handler:
         if json_writer:
             stop_handler.add_flush_hook(lambda: json_writer.close())
+        # ensure shard manifest and progress are saved on stop
+        stop_handler.add_flush_hook(lambda: sharding.save_manifest())
         stop_handler.add_flush_hook(lambda: progress_tracker.save_final())
     
     initial_stats = progress_tracker.get_statistics()
     logging.info(f"📊 Starting with {initial_stats['completed']:,} completed, {initial_stats['missing']:,} missing")
     logging.info(f"🚀 Using tar-grouped extraction with {cfg.workers} workers")
     logging.info(f"💾 RAID optimized: {cfg.write_buffer_size_mb}MB write buffers")
+
+    # Log current sharding statistics
+    shard_stats = sharding.get_statistics()
+    if shard_stats:
+        logging.info(f"📊 Sharding stats: {shard_stats}")
     
     try:
         total_tar_files = len(grouped_metadata)
@@ -1348,7 +1532,16 @@ def process_extractions_by_tar_file(grouped_metadata: Dict[str, List[Dict[str, A
     finally:
         if json_writer:
             json_writer.close()
+        # Save manifest and progress on exit
+        sharding.save_manifest()
         progress_tracker.save_final()
+        # Log final sharding statistics
+        final_stats = sharding.get_statistics()
+        if final_stats:
+            logging.info(f"📊 Final sharding statistics:")
+            logging.info(f"   Total shards: {final_stats.get('total_shards', 0)}")
+            logging.info(f"   Average files per shard: {final_stats.get('average_shard_fill', 0):.1f}")
+            logging.info(f"   Min/Max shard fill: {final_stats.get('min_shard_fill', 0)}/{final_stats.get('max_shard_fill', 0)}")
 
 # ---------------------------------------------------------------------------
 # Tar Index
