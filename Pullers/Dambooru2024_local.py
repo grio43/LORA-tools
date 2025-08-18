@@ -954,46 +954,123 @@ class TarIndex:
         except Exception as e:
             logging.error(f"Failed to load cache: {e}")
             self._build_from_json_files()
+
+    def _extract_id_from_key(self, key: str) -> Optional[int]:
+        """Extract numeric file ID from a manifest key like '123456.png' or 'subdir/123456.webp'.
+
+        This helper safely parses a string key to pull out the numeric identifier before any
+        directory segments or file extensions. If the key does not end with a numeric stem,
+        ``None`` is returned instead of raising an exception.
+
+        Args:
+            key: The manifest key, which may include path separators and a file extension.
+
+        Returns:
+            The integer file ID if it can be parsed, otherwise ``None``.
+        """
+        if not isinstance(key, str):
+            return None
+        # Only consider the last path component and drop the extension
+        base = key.rsplit('/', 1)[-1]
+        stem = base.split('.', 1)[0]
+        try:
+            return int(stem)
+        except ValueError:
+            return None
+
+    def _iter_manifest_keys(self, data: Any):
+        """Yield possible file path keys from a variety of WebDataset-style manifests.
+
+        This method supports several manifest shapes commonly used by WebDataset and similar
+        tools. It will gracefully handle dictionaries and lists, looking for keys in
+        ``files`` dicts or lists, ``keys`` lists, lists of ``entries``/``samples`` with
+        ``path``, ``name``, ``key`` or ``filename`` fields. As a fallback it yields any
+        string values contained directly within the top-level collection. If the input
+        structure is not iterable or does not match known patterns, the method quietly
+        returns without yielding anything.
+
+        Args:
+            data: Parsed JSON data which may be a dictionary or list representing a manifest.
+
+        Yields:
+            Strings representing potential file paths inside the tar.
+        """
+        try:
+            # Dictionaries have specific structures we can handle
+            if isinstance(data, dict):
+                # WebDataset: {'files': {<path>: ...}}
+                if isinstance(data.get('files'), dict):
+                    for k in data['files'].keys():
+                        if isinstance(k, str):
+                            yield k
+                    return
+                # WebDataset alt: {'files': [<path>, ...]}
+                if isinstance(data.get('files'), list):
+                    for k in data['files']:
+                        if isinstance(k, str):
+                            yield k
+                # Generic: {'keys': [<path>, ...]}
+                if isinstance(data.get('keys'), list):
+                    for k in data['keys']:
+                        if isinstance(k, str):
+                            yield k
+                # Other manifest shapes: entries with path/name/key
+                if isinstance(data.get('entries'), list):
+                    for e in data['entries']:
+                        if isinstance(e, dict):
+                            k = e.get('path') or e.get('name') or e.get('key')
+                            if isinstance(k, str):
+                                yield k
+                # Another shape: samples with key/filename
+                if isinstance(data.get('samples'), list):
+                    for s in data['samples']:
+                        if isinstance(s, dict):
+                            k = s.get('key') or s.get('filename')
+                            if isinstance(k, str):
+                                yield k
+                # Fallback: iterate over direct string values in dict
+                for v in data.values():
+                    if isinstance(v, str):
+                        yield v
+                    elif isinstance(v, list):
+                        for x in v:
+                            if isinstance(x, str):
+                                yield x
+            # If the data is a simple list, yield string elements
+            elif isinstance(data, list):
+                for k in data:
+                    if isinstance(k, str):
+                        yield k
+        except Exception:
+            # Silently ignore malformed structures
+            return
     
     def _build_from_json_files(self):
         """Build index from the JSON files next to tar files."""
         logging.info("📚 Building index from JSON files...")
-        
         tar_files = sorted(self.source_dir.glob("*.tar"))
         if not tar_files:
             logging.warning(f"⚠️ No tar files found in {self.source_dir}")
             return
-        
-        # Process each tar's JSON file
-        for tar_path in tar_files:  # Process all tar files, not just first 100
+
+        for tar_path in tar_files:
             tar_name = tar_path.name
             json_path = tar_path.with_suffix('.json')
-            
             if not json_path.exists():
                 logging.warning(f"No JSON for {tar_name}")
                 continue
-            
             try:
-                with open(json_path, 'r') as f:
+                with open(json_path, 'r', encoding='utf-8') as f:
                     data = json.load(f)
-                
-                if 'files' in data and isinstance(data['files'], dict):
-                    # Process the dictionary entries
-                    for key in data['files'].keys():
-                        # Extract numeric ID from key
-                        base_key = key.rsplit('/', 1)[-1]
-                        file_id_str = base_key.split('.')[0] if '.' in base_key else base_key
-                        try:
-                            file_id = int(file_id_str)
-                            self.index[file_id] = tar_name
-                            if '/' in key:
-                                self.index_paths[file_id] = key
-                        except ValueError:
-                            continue
-                                       
+                for key in self._iter_manifest_keys(data):
+                    fid = self._extract_id_from_key(key)
+                    if fid is not None:
+                        self.index[fid] = tar_name
+                        # remember full internal path (subdirs + extension)
+                        self.index_paths[fid] = key
             except Exception as e:
                 logging.error(f"Failed to process {json_path}: {e}")
-        
+
         logging.info(f"✅ Built index with {len(self.index):,} file ID mappings")
     
     def find_image(self, image_id: int, file_url: str = "") -> Optional[Tuple[str, str]]:
@@ -1015,19 +1092,18 @@ class TarIndex:
             json_path = self.source_dir / tar_name.replace('.tar', '.json')
             if json_path.exists():
                 try:
-                    with open(json_path, 'r') as f:
+                    with open(json_path, 'r', encoding='utf-8') as f:
                         data = json.load(f)
-                        files = data.get('files', {})
-                        if isinstance(files, dict):
-                            for k in files.keys():
-                                if not isinstance(k, str):
-                                    continue
-                                if k.startswith(f"{image_id}.") or k.rsplit('/', 1)[-1].startswith(f"{image_id}."):
-                                    actual_ext = os.path.splitext(k)[1]
-                                    internal_path = k  # Prefer discovered full path
-                                    with self.lock:
-                                        self.index_paths[image_id] = internal_path
-                                    break
+                    for k in self._iter_manifest_keys(data):
+                        if not isinstance(k, str):
+                            continue
+                        base = k.rsplit('/', 1)[-1]
+                        if base.startswith(f"{image_id}."):
+                            actual_ext = os.path.splitext(k)[1]
+                            internal_path = k  # Prefer discovered full path
+                            with self.lock:
+                                self.index_paths[image_id] = internal_path
+                            break
                 except Exception:
                     pass
 
