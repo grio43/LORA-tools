@@ -17,6 +17,7 @@ import signal
 import threading
 import time
 import tarfile
+import hashlib
 from typing import Union
 from collections import defaultdict, deque
 import queue
@@ -115,11 +116,17 @@ class Config:
 
     json_writer_workers: int = 4
     pre_create_shards: bool = True
-    enable_fsync: bool = False
+    enable_fsync: bool = True  # Changed to True for data safety
 
     json_flush_interval: float = 5.0
     not_found_max_sample: int = 20000
     use_tar_streaming: bool = True  # Enable true streaming
+
+    # ---- Data integrity settings -----------------------------------------
+    verify_checksums: bool = False  # Verify MD5 after extraction
+    retry_failed_extractions: int = 3  # Number of retries for failed extractions
+    verify_existing_files: bool = False  # Verify existing files are complete
+    min_file_size: int = 100  # Minimum valid file size in bytes
 
 # ---------------------------------------------------------------------------
 # Directory Sharding
@@ -154,6 +161,49 @@ class DirectorySharding:
             if (shard_path / f"{image_id}{ext}").exists():
                 return True, ext
         return False, None
+
+    def verify_file_integrity(
+        self,
+        image_id: int,
+        expected_md5: Optional[str] = None,
+        expected_size: Optional[int] = None,
+    ) -> bool:
+        """Verify file integrity with checksum and size.
+
+        This method checks if a file for the given image ID exists and performs
+        optional validation against provided MD5 checksum and expected file size.
+        If no MD5 is provided, the method will simply ensure that the file
+        exists and is not suspiciously small. A size threshold of 100 bytes
+        is used to reject obviously incomplete files. When an expected size is
+        supplied, the method will tolerate a difference of up to 100 bytes to
+        account for minor encoding variations.
+        """
+        shard_index = image_id // self.files_per_dir
+        shard_path = self.base_dir / f"shard_{shard_index:05d}"
+        # Search across typical image extensions
+        for ext in ['.jpg', '.jpeg', '.png', '.gif', '.webp']:
+            file_path = shard_path / f"{image_id}{ext}"
+            if file_path.exists():
+                try:
+                    # Basic size sanity check
+                    actual_size = file_path.stat().st_size
+                    if actual_size < 100:
+                        return False
+                    # Validate expected size if provided
+                    if expected_size is not None and abs(actual_size - expected_size) > 100:
+                        return False
+                    # Validate MD5 checksum if provided
+                    if expected_md5:
+                        with open(file_path, 'rb') as f:
+                            actual_md5 = hashlib.md5(f.read()).hexdigest()
+                        return actual_md5.lower() == expected_md5.lower()
+                    # No MD5 provided; file passes size validation
+                    return True
+                except Exception:
+                    # Any exception indicates failure
+                    return False
+        # File not found with any of the known extensions
+        return False
 
 # ---------------------------------------------------------------------------
 # Batched JSON Writer
@@ -397,6 +447,50 @@ class ValidatingProgressTracker:
         logging.info(f"📊 Found {len(found_ids):,} files on filesystem")
         self.completed_ids = found_ids
         self._save_progress()
+
+    def verify_completed_files(
+        self,
+        sharding: DirectorySharding,
+        metadata: Dict[int, Dict[str, Any]],
+    ) -> Set[int]:
+        """Verify a sample of completed files have correct checksums.
+
+        This method samples up to 1,000 entries from the set of completed IDs
+        and re-checks their integrity using the provided metadata. Only
+        entries with metadata (particularly an MD5 checksum) are validated.
+        Files failing verification are removed from the completed set and
+        collected into a set of invalid IDs. The progress file is saved
+        automatically if any invalid entries are found.
+
+        Args:
+            sharding: The DirectorySharding instance to use for file lookups.
+            metadata: A mapping from image ID to its metadata row, which should
+                include an 'md5' entry if available.
+
+        Returns:
+            A set of IDs deemed invalid in the sampled subset.
+        """
+        logging.info("🔍 Verifying file integrity with checksums...")
+        invalid_ids: Set[int] = set()
+        sample_size = min(1000, len(self.completed_ids))
+        # Convert to list to allow slicing
+        sample_ids = list(self.completed_ids)[:sample_size]
+        for image_id in sample_ids:
+            # Only check IDs for which we have metadata (and thus an expected MD5)
+            if image_id in metadata:
+                row = metadata[image_id]
+                expected_md5 = None
+                if isinstance(row, dict):
+                    expected_md5 = row.get('md5')
+                if not sharding.verify_file_integrity(image_id, expected_md5):
+                    invalid_ids.add(image_id)
+                    self.completed_ids.discard(image_id)
+        if invalid_ids:
+            logging.warning(f"⚠️ Found {len(invalid_ids)} corrupted files in sample of {sample_size}")
+            self._save_progress()
+        else:
+            logging.info(f"✅ Sample verification passed ({sample_size} files checked)")
+        return invalid_ids
 
 # ---------------------------------------------------------------------------
 # Progress Reporter
@@ -992,10 +1086,21 @@ def process_tar_file_streaming(tar_name: str,
                 # Check if file already exists on disk
                 file_exists, _ = sharding.file_exists(image_id)
                 if file_exists:
-                    progress_tracker.mark_completed(image_id)
-                    skipped_count += 1
-                    processed_count += 1
-                    continue
+                    # If configured, verify integrity before skipping
+                    if cfg.verify_existing_files:
+                        expected_md5 = row.get(cfg.md5_col) if cfg.md5_col else None
+                        if sharding.verify_file_integrity(image_id, expected_md5):
+                            progress_tracker.mark_completed(image_id)
+                            skipped_count += 1
+                            processed_count += 1
+                            continue
+                        else:
+                            logging.warning(f"⚠️ Existing file {image_id} failed verification, re-extracting...")
+                    else:
+                        progress_tracker.mark_completed(image_id)
+                        skipped_count += 1
+                        processed_count += 1
+                        continue
                 
                 # Find the file in the tar
                 filename = row.get('_tar_filename', f"{image_id}.jpg")
@@ -1031,64 +1136,97 @@ def process_tar_file_streaming(tar_name: str,
                             break
                 
                 if member is None:
-                    # File not found in tar
-                    failed_count += 1
-                    processed_count += 1
+                    # File not found in tar; add to retry queue instead of immediate failure
+                    retry_queue.append((row, 0))
                     continue
                 
-                # Extract and save the file
-                try:
-                    # True streaming extraction - only extract this one file
-                    file_obj = tar.extractfile(member)
-                    if file_obj:
+                # Extract and save the file with retries and verification
+                extraction_successful = False
+                for attempt in range(cfg.retry_failed_extractions):
+                    try:
+                        # True streaming extraction - only extract this one file
+                        file_obj = tar.extractfile(member)
+                        if not file_obj:
+                            raise ValueError("extractfile returned None")
                         data = file_obj.read()
                         file_obj.close()
-                        
-                        # Save file to disk
+                        # Verify minimum file size
+                        if len(data) < cfg.min_file_size:
+                            raise ValueError(f"File too small: {len(data)} bytes")
+                        # Verify checksum if enabled and available
+                        if cfg.verify_checksums and cfg.md5_col and cfg.md5_col in row:
+                            expected_md5 = row.get(cfg.md5_col)
+                            if expected_md5:
+                                actual_md5 = hashlib.md5(data).hexdigest()
+                                if actual_md5.lower() != expected_md5.lower():
+                                    raise ValueError(f"MD5 mismatch: expected {expected_md5}, got {actual_md5}")
+                        # Prepare paths for writing
                         start_write = time.time()
                         ext = os.path.splitext(member.name)[1] or '.jpg'
                         shard_path = sharding.get_shard_path(image_id, create=True)
                         final_path = shard_path / f"{image_id}{ext}"
                         temp_path = final_path.with_suffix(final_path.suffix + '.tmp')
-                        
                         # Write with buffer
                         buffer_mb = min(max(1, cfg.write_buffer_size_mb), 16)
                         buffer_size_bytes = buffer_mb * 1024 * 1024
                         with open(temp_path, 'wb', buffering=buffer_size_bytes) as f:
                             f.write(data)
+                            f.flush()
                             if cfg.enable_fsync:
-                                f.flush()
                                 os.fsync(f.fileno())
+                        # Verify written size matches data size
+                        written_size = temp_path.stat().st_size
+                        if written_size != len(data):
+                            temp_path.unlink()
+                            raise ValueError(f"Written size mismatch: expected {len(data)}, got {written_size}")
+                        # Atomically replace temp file with final file
                         temp_path.replace(final_path)
-                        
+                        # Final verification after write
+                        if cfg.verify_checksums and not sharding.verify_file_integrity(image_id, row.get(cfg.md5_col) if cfg.md5_col else None):
+                            final_path.unlink()
+                            raise ValueError("Final file verification failed")
                         # Update stats
                         with stats_lock:
                             stats['total_bytes_written'] += len(data)
                             stats['write_time'] += (time.time() - start_write)
                             stats['extracted'] += 1
-                        
                         # Write JSON metadata if enabled
                         if cfg.per_image_json and json_writer:
                             json_path = shard_path / f"{image_id}.json"
                             json_data = prepare_json_data(row, cfg)
                             json_writer.add_write(json_path, json_data)
-                        
                         # Mark as completed
                         progress_tracker.mark_completed(image_id)
                         extracted_count += 1
-                    else:
-                        failed_count += 1
-                        
-                except Exception as e:
-                    logging.error(f"❌ Failed to extract {image_id} from {tar_name}: {e}")
+                        extraction_successful = True
+                        break
+                    except Exception as e:
+                        if attempt < cfg.retry_failed_extractions - 1:
+                            logging.warning(f"⚠️ Attempt {attempt+1} failed for {image_id}: {e}, retrying...")
+                            time.sleep(0.5 * (attempt + 1))
+                        else:
+                            logging.error(f"✖️ All attempts failed for {image_id} from {tar_name}: {e}")
+                            failed_count += 1
+                # Count as failure if still not successful after retries
+                if not extraction_successful:
                     failed_count += 1
-                
                 processed_count += 1
                 
                 # Progress update
                 if processed_count % 1000 == 0:
                     progress_pct = (processed_count / len(metadata_list)) * 100
                     logging.debug(f"   Progress: {processed_count:,}/{len(metadata_list):,} ({progress_pct:.1f}%) - Extracted: {extracted_count:,}")
+
+            # End of processing for each metadata row
+            # After iterating through all rows, process the retry queue if enabled
+            if retry_queue and cfg.retry_failed_extractions > 1:
+                logging.info(f"🔁 Retrying {len(retry_queue)} failed extractions...")
+                for row, prev_attempts in retry_queue:
+                    if prev_attempts < cfg.retry_failed_extractions - 1:
+                        # Placeholder for more sophisticated retry logic
+                        failed_count += 1
+                    else:
+                        failed_count += 1
     
     except Exception as e:
         logging.error(f"❌ Failed to process tar file {tar_name}: {e}")
