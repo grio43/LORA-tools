@@ -28,6 +28,9 @@ from typing import List, Optional, Iterator, Dict, Any, Set, Tuple, Callable
 from functools import lru_cache
 import io
 
+# Additional utility for robust file URL parsing
+from urllib.parse import urlparse
+
 import polars as pl
 import psutil
 
@@ -53,6 +56,8 @@ class Config:
     file_path_col: str = "file_url"
     file_id_col: str = "media_asset.id"  # Not used - kept for compatibility
     id_col: str = "id"  # Primary ID for both finding files and metadata association
+    # Some mirrors include md5 in metadata; if present we use it for robust lookup
+    md5_col: str = "md5"
 
     # ---- Filtering (unchanged) --------------------------------------------
     enable_include_tags: bool = False
@@ -803,7 +808,13 @@ def stream_filtered_metadata(path: Path, cfg: Config, stop_handler: Optional[Sof
     # Get available columns
     available_cols = set(lf.schema.keys())
     final_cols = list(cols_to_load.intersection(available_cols))
-    
+
+    # md5 is optional; if present we’ll include it and pass it to TarIndex
+    # (some Danbooru mirrors name files by md5). We'll add it to the selection once we know it exists.
+    wants_md5 = cfg.md5_col
+    if wants_md5 and wants_md5 in available_cols:
+        final_cols.append(wants_md5)
+
     if final_cols:
         lf = lf.select(final_cols)
     
@@ -898,8 +909,12 @@ class TarIndex:
     
     def __init__(self, source_dir: Path, rebuild: bool = False):
         self.source_dir = source_dir
-        self.index = {}  # {file_id: tar_name}
-        self.index_paths = {}  # {file_id: internal path within tar (if known)}
+        # Primary numeric-id index
+        self.index: Dict[int, str] = {}       # {file_id: tar_name}
+        self.index_paths: Dict[int, str] = {}  # {file_id: internal path within tar}
+        # Supplemental indices for mirrors that use md5-based naming
+        self.basename_index: Dict[str, Tuple[str, str]] = {}  # {'md5.ext': (tar, fullpath)}
+        self.md5_index: Dict[str, Tuple[str, str]] = {}       # {'32hex': (tar, fullpath)}
         self.lock = threading.Lock()
         
         # Use the existing cache that's already built
@@ -977,6 +992,23 @@ class TarIndex:
             return int(stem)
         except ValueError:
             return None
+
+    def _extract_md5_from_basename(self, basename: str) -> Optional[str]:
+        """
+        If basename looks like '<md5>.<ext>' where <md5> is 32 hex chars, return the md5.
+        Otherwise return None.
+        """
+        if not isinstance(basename, str):
+            return None
+        name_only = basename.rsplit('/', 1)[-1]
+        stem = name_only.split('.', 1)[0]
+        if len(stem) == 32:
+            try:
+                int(stem, 16)
+                return stem.lower()
+            except ValueError:
+                return None
+        return None
 
     def _iter_manifest_keys(self, data: Any):
         """Yield possible file path keys from a variety of WebDataset-style manifests.
@@ -1063,32 +1095,75 @@ class TarIndex:
                 with open(json_path, 'r', encoding='utf-8') as f:
                     data = json.load(f)
                 for key in self._iter_manifest_keys(data):
+                    # Always record basename-based index
+                    base = key.rsplit('/', 1)[-1]
+                    self.basename_index[base] = (tar_name, key)
+                    # Optional: md5 index (for mirrors with md5 filenames)
+                    md5 = self._extract_md5_from_basename(base)
+                    if md5:
+                        self.md5_index[md5] = (tar_name, key)
+
+                    # Primary numeric-id index (when keys end with numeric id)
                     fid = self._extract_id_from_key(key)
                     if fid is not None:
                         self.index[fid] = tar_name
-                        # remember full internal path (subdirs + extension)
-                        self.index_paths[fid] = key
+                        self.index_paths[fid] = key  # remember full internal path
             except Exception as e:
                 logging.error(f"Failed to process {json_path}: {e}")
 
         logging.info(f"✅ Built index with {len(self.index):,} file ID mappings")
     
-    def find_image(self, image_id: int, file_url: str = "") -> Optional[Tuple[str, str]]:
+    def find_image(self, image_id: int, file_url: str = "", md5: Optional[str] = None
+                   ) -> Optional[Tuple[str, str]]:
         """
-         Find which tar contains an image based on image ID.
-        Returns (tar_name, filename_or_fullpath) or None.
+        Resolve an image to (tar_name, internal_path) using multiple strategies:
+        1) numeric id mapping (fast path)
+        2) explicit md5 (from metadata) or md5 derived from file_url
+        3) basename from file_url (e.g., '<md5>.webp')
+        Returns None if no matching entry is found.
         """
+        internal_path: Optional[str] = None
+        tar_name: Optional[str] = None
+        # 1) direct id mapping
         with self.lock:
-            tar_name = self.index.get(image_id)
-            if not tar_name:
-                return None
-            internal_path = self.index_paths.get(image_id)
+            if image_id in self.index:
+                tar_name = self.index[image_id]
+                internal_path = self.index_paths.get(image_id)
 
-        actual_ext = None
-        if internal_path:
-            actual_ext = os.path.splitext(internal_path)[1]
-        else:
-            # Try to get extension/path from the tar's sidecar JSON if available
+        actual_ext: Optional[str] = None
+        # 2) md5 path (explicit or derived from URL)
+        if tar_name is None:
+            # Derive md5 from URL if not provided
+            if not md5 and file_url:
+                try:
+                    url_path = urlparse(file_url).path or file_url
+                except Exception:
+                    url_path = file_url
+                candidate = url_path.rsplit('/', 1)[-1]
+                md5 = self._extract_md5_from_basename(candidate) or md5
+            if md5:
+                with self.lock:
+                    md5_hit = self.md5_index.get(md5)
+                if md5_hit:
+                    tar_name, internal_path = md5_hit
+                    actual_ext = os.path.splitext(internal_path)[1]
+
+        # 3) basename from URL (if still unresolved)
+        if tar_name is None and file_url:
+            try:
+                url_path = urlparse(file_url).path or file_url
+            except Exception:
+                url_path = file_url
+            base = url_path.rsplit('/', 1)[-1]
+            with self.lock:
+                base_hit = self.basename_index.get(base)
+            if base_hit:
+                tar_name, internal_path = base_hit
+                actual_ext = os.path.splitext(internal_path)[1]
+
+        # If still unresolved, and id mapping existed (without stored path), try to discover
+        # the ext/path from the sidecar json lazily (kept from original code)
+        if tar_name and not internal_path:
             json_path = self.source_dir / tar_name.replace('.tar', '.json')
             if json_path.exists():
                 try:
@@ -1107,15 +1182,20 @@ class TarIndex:
                 except Exception:
                     pass
 
-        # Fall back to URL extension or default
+        if not tar_name:
+            return None
+
+        # Determine extension
+        actual_ext = actual_ext or None
         ext = actual_ext or '.jpg'
+        # Try to get extension from URL if none from above
         if file_url and not actual_ext:
             ext_match = re.search(r'\.(jpg|jpeg|png|gif|webp)$', file_url, re.IGNORECASE)
             if ext_match:
                 ext = ext_match.group(0)
 
-        filename = internal_path if internal_path else f"{image_id}{ext}"
-        return (tar_name, filename)
+        filename_or_path = internal_path if internal_path else f"{image_id}{ext}"
+        return (tar_name, filename_or_path)
 
     def cache_discovered_path(self, image_id: int, tar_name: str, internal_path: str) -> None:
         """Cache a discovered full internal path for future lookups."""
@@ -1127,6 +1207,8 @@ class TarIndex:
         """Get index statistics for debugging."""
         stats = {
             'total_images': len(self.index),
+            'basename_entries': len(self.basename_index),
+            'md5_entries': len(self.md5_index),
             'sample_mappings': dict(list(self.index.items())[:10]) if self.index else {}
         }
         return stats
@@ -1496,7 +1578,7 @@ def process_extractions_streaming(metadata_stream: Iterator[Dict[str, Any]],
 
             # Find tar info
             file_url = row.get(cfg.file_path_col, "")
-            tar_info = tar_index.find_image(image_id, file_url)
+            tar_info = tar_index.find_image(image_id, file_url, row.get(cfg.md5_col))
             if not tar_info:
                 with stats_lock:
                     stats['not_found'] += 1
@@ -1507,47 +1589,55 @@ def process_extractions_streaming(metadata_stream: Iterator[Dict[str, Any]],
 
             # Check if we need to switch tar files
             if tar_name != current_tar:
-                # ALWAYS process any pending extractions from previous tar, regardless of batch size
+                # ALWAYS process any pending extractions from previous tar
                 if pending_extractions:
                     logging.debug(f"🔄 Processing {len(pending_extractions)} pending files before switching tar")
-                    if not current_tar_handle:
-                        logging.warning(f"⚠️ Tar handle missing for pending extractions, attempting recovery")
-                    if current_tar_handle:
-                        process_pending_extractions(
-                            current_tar_handle, current_members, pending_extractions,
-                            cfg, current_tar, sharding, progress_tracker, json_writer,
-                            tar_index, stats, stats_lock
-                        )
+                    if current_tar:
+                        if cfg.use_tar_streaming:
+                            # Stream the previous tar before switching
+                            tar_path_prev = Path(cfg.source_images_dir) / current_tar
+                            logging.info(f"📂 Opening {current_tar}...")
+                            process_tar_streaming(
+                                cfg, tar_path_prev, 'r|', pending_extractions,
+                                sharding, progress_tracker, json_writer,
+                                tar_index, stats, stats_lock
+                            )
+                            # Log memory usage after closing stream
+                            mem_usage = psutil.Process().memory_info().rss / 1024**3
+                            logging.info(f"📁 Closed {current_tar} | Memory: {mem_usage:.1f}GB")
+                        else:
+                            # Random-access: use existing handle if available
+                            if current_tar_handle:
+                                process_pending_extractions(
+                                    current_tar_handle, current_members, pending_extractions,
+                                    cfg, current_tar, sharding, progress_tracker, json_writer,
+                                    tar_index, stats, stats_lock
+                                )
                     pending_extractions = []
 
-                # Close previous tar
+                # Close previous tar handle if open
                 if current_tar_handle:
                     current_tar_handle.close()
                     mem_usage = psutil.Process().memory_info().rss / 1024**3
                     logging.info(f"📁 Closed {current_tar} | Memory: {mem_usage:.1f}GB")
 
-                # Open new tar
-                tar_path = Path(cfg.source_images_dir) / tar_name
-                logging.info(f"📂 Opening {tar_name}...")
-
-                try:
-                    # Use streaming mode if configured
-                    tar_mode = 'r|' if cfg.use_tar_streaming else 'r'
-                    current_tar_handle = tarfile.open(tar_path, tar_mode)
-
-                    # Build member index (skip for streaming mode)
-                    if not cfg.use_tar_streaming:
+                # Switch to new tar
+                current_tar = tar_name
+                current_members = {}
+                current_tar_handle = None
+                if not cfg.use_tar_streaming:
+                    # Only open tar in random-access mode
+                    tar_path_new = Path(cfg.source_images_dir) / tar_name
+                    logging.info(f"📂 Opening {tar_name}...")
+                    try:
+                        current_tar_handle = tarfile.open(tar_path_new, 'r')
                         current_members = {m.name: m for m in current_tar_handle}
-                    else:
-                        current_members = {}
-
-                    current_tar = tar_name
-
-                except Exception as e:
-                    logging.error(f"Failed to open tar {tar_name}: {e}")
-                    with stats_lock:
-                        stats['failed'] += 1
-                    continue
+                    except Exception as e:
+                        logging.error(f"Failed to open tar {tar_name}: {e}")
+                        with stats_lock:
+                            stats['failed'] += 1
+                        current_tar = None
+                        continue
 
             # Add to pending extractions
             pending_extractions.append((image_id, filename, row))
@@ -1560,13 +1650,29 @@ def process_extractions_streaming(metadata_stream: Iterator[Dict[str, Any]],
                 (stop_handler and stop_handler.should_stop())
             )
 
-            if should_process and current_tar_handle:
-                process_pending_extractions(
-                    current_tar_handle, current_members, pending_extractions,
-                    cfg, current_tar, sharding, progress_tracker, json_writer,
-                    tar_index, stats, stats_lock
-                )
-                pending_extractions = []
+            if should_process and current_tar:
+                if cfg.use_tar_streaming:
+                    # Use true sequential scan for streaming tars (no random access)
+                    tar_path_cur = Path(cfg.source_images_dir) / current_tar
+                    logging.info(f"📂 Opening {current_tar}...")
+                    process_tar_streaming(
+                        cfg, tar_path_cur, 'r|', pending_extractions,
+                        sharding, progress_tracker, json_writer,
+                        tar_index, stats, stats_lock
+                    )
+                    # Close & log memory after streaming pass
+                    mem_usage = psutil.Process().memory_info().rss / 1024**3
+                    logging.info(f"📁 Closed {current_tar} | Memory: {mem_usage:.1f}GB")
+                    pending_extractions = []
+                else:
+                    # Random-access path (existing behavior)
+                    if current_tar_handle:
+                        process_pending_extractions(
+                            current_tar_handle, current_members, pending_extractions,
+                            cfg, current_tar, sharding, progress_tracker, json_writer,
+                            tar_index, stats, stats_lock
+                        )
+                        pending_extractions = []
 
                 # Report progress
                 if progress_reporter.should_report():
@@ -1580,28 +1686,42 @@ def process_extractions_streaming(metadata_stream: Iterator[Dict[str, Any]],
         # This ensures we don't skip files that didn't meet the batch threshold
         if pending_extractions:
             logging.info(f"📦 Processing final batch of {len(pending_extractions)} files...")
-
-            # Try to process even if tar handle is missing (shouldn't happen but be defensive)
-            if not current_tar_handle and current_tar:
-                try:
-                    tar_path = Path(cfg.source_images_dir) / current_tar
-                    if tar_path.exists():
-                        logging.warning(f"⚠️ Reopening {current_tar} for final batch processing")
-                        tar_mode = 'r|' if cfg.use_tar_streaming else 'r'
-                        current_tar_handle = tarfile.open(tar_path, tar_mode)
-                        if not cfg.use_tar_streaming:
-                            current_members = {m.name: m for m in current_tar_handle}
-                except Exception as e:
-                    logging.error(f"❌ Failed to reopen tar for final batch: {e}")
-
-            if current_tar_handle:
-                process_pending_extractions(
-                    current_tar_handle, current_members, pending_extractions,
-                    cfg, current_tar, sharding, progress_tracker, json_writer,
-                    tar_index, stats, stats_lock
-                )
+            if current_tar:
+                if cfg.use_tar_streaming:
+                    # Streaming mode: open tar and process sequentially
+                    tar_path_final = Path(cfg.source_images_dir) / current_tar
+                    logging.info(f"📂 Opening {current_tar}...")
+                    process_tar_streaming(
+                        cfg, tar_path_final, 'r|', pending_extractions,
+                        sharding, progress_tracker, json_writer,
+                        tar_index, stats, stats_lock
+                    )
+                    mem_usage = psutil.Process().memory_info().rss / 1024**3
+                    logging.info(f"📁 Closed {current_tar} | Memory: {mem_usage:.1f}GB")
+                else:
+                    # Random-access fallback
+                    if not current_tar_handle and current_tar:
+                        try:
+                            tar_path_final = Path(cfg.source_images_dir) / current_tar
+                            if tar_path_final.exists():
+                                logging.warning(f"⚠️ Reopening {current_tar} for final batch processing")
+                                current_tar_handle = tarfile.open(tar_path_final, 'r')
+                                current_members = {m.name: m for m in current_tar_handle}
+                        except Exception as e:
+                            logging.error(f"❌ Failed to reopen tar for final batch: {e}")
+                    if current_tar_handle:
+                        process_pending_extractions(
+                            current_tar_handle, current_members, pending_extractions,
+                            cfg, current_tar, sharding, progress_tracker, json_writer,
+                            tar_index, stats, stats_lock
+                        )
+                    else:
+                        logging.error(f"❌ Unable to process final {len(pending_extractions)} files - tar handle unavailable")
+                        with stats_lock:
+                            stats['failed'] += len(pending_extractions)
             else:
-                logging.error(f"❌ Unable to process final {len(pending_extractions)} files - tar handle unavailable")
+                # No current tar available
+                logging.error(f"❌ Unable to process final {len(pending_extractions)} files - no current tar")
                 with stats_lock:
                     stats['failed'] += len(pending_extractions)
 
@@ -1730,7 +1850,7 @@ def process_extractions_tar_major(metadata_stream: Iterator[Dict[str, Any]],
 
         # Determine which tar and filename contain this image
         file_url = row.get(cfg.file_path_col, "")
-        tar_info = tar_index.find_image(image_id, file_url)
+        tar_info = tar_index.find_image(image_id, file_url, row.get(cfg.md5_col))
         if not tar_info:
             with stats_lock:
                 stats['not_found'] += 1
@@ -1989,7 +2109,12 @@ def main() -> None:
     index_stats = tar_index.get_statistics()
     logging.info(f"📊 Index statistics:")
     logging.info(f"   Total indexed file IDs: {index_stats['total_images']:,}")
-    if index_stats['sample_mappings']:
+    # Additional index statistics if present
+    if 'basename_entries' in index_stats:
+        logging.info(f"   Basename mappings: {index_stats['basename_entries']:,}")
+    if 'md5_entries' in index_stats:
+        logging.info(f"   MD5 mappings: {index_stats['md5_entries']:,}")
+    if index_stats.get('sample_mappings'):
         logging.info(f"   Sample mappings: {index_stats['sample_mappings']}")
     
     # Important note about the ID column
