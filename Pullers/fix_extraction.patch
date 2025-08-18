@@ -1,133 +1,264 @@
 --- a/Dambooru2024_local.py
 +++ b/Dambooru2024_local.py
-@@ -559,11 +559,11 @@ def detect_metadata_structure(path: Path, cfg: Config) -> None:
-     """Auto-detect metadata structure and update config accordingly."""
-     logging.info("🔍 Detecting metadata structure...")
+@@ -469,7 +469,7 @@ def build_polars_filter_expr(cfg: Config) -> pl.Expr:
+                 pattern = create_tag_pattern(char)
+                 char_filters.append(pl.col(cfg.character_tags_col).str.contains(pattern))
+             if char_filters:
+-                filters.append(pl.any_horizontal(char_filters))
++                filters.append(pl.any_horizontal(*char_filters))
+         
+         if cfg.exclude_characters:
+             for char in cfg.exclude_characters:
+@@ -483,7 +483,7 @@ def build_polars_filter_expr(cfg: Config) -> pl.Expr:
+                 pattern = create_tag_pattern(copy)
+                 copy_filters.append(pl.col(cfg.copyright_tags_col).str.contains(pattern))
+             if copy_filters:
+-                filters.append(pl.any_horizontal(copy_filters))
++                filters.append(pl.any_horizontal(*copy_filters))
+         
+         if cfg.exclude_copyrights:
+             for copy in cfg.exclude_copyrights:
+@@ -497,7 +497,7 @@ def build_polars_filter_expr(cfg: Config) -> pl.Expr:
+                 pattern = create_tag_pattern(artist)
+                 artist_filters.append(pl.col(cfg.artist_tags_col).str.contains(pattern))
+             if artist_filters:
+-                filters.append(pl.any_horizontal(artist_filters))
++                filters.append(pl.any_horizontal(*artist_filters))
+         
+         if cfg.exclude_artists:
+             for artist in cfg.exclude_artists:
+@@ -525,7 +525,7 @@ def build_polars_filter_expr(cfg: Config) -> pl.Expr:
+             elif rating_lower in ["explicit", "e"]:
+                 rating_filters.append(rate_col.is_in(["explicit", "e"]))
+         if rating_filters:
+-            filters.append(pl.any_horizontal(rating_filters))
++            filters.append(pl.any_horizontal(*rating_filters))
      
-     # First check with pandas to see if ID is in index
+     # Dimension filtering
+     if cfg.enable_dimension_filtering:
+@@ -547,7 +547,7 @@ def build_polars_filter_expr(cfg: Config) -> pl.Expr:
+     # Combine all filters
+     if not filters:
+         return pl.lit(True)
+-    return pl.all_horizontal(filters)
++    return pl.all_horizontal(*filters)
+ 
+ def detect_metadata_structure(path: Path, cfg: Config) -> None:
+     """Auto-detect metadata structure and update config accordingly."""
+@@ -555,18 +555,38 @@ def detect_metadata_structure(path: Path, cfg: Config) -> None:
      try:
          import pandas as pd
--        pdf = pd.read_parquet(str(path), nrows=5)
-+        pdf = pd.read_parquet(str(path), engine='pyarrow').head(5)
-         
+-        pdf = pd.read_parquet(str(path), engine='pyarrow').head(5)
++        # Only read first few rows for structure detection
++        pdf = pd.read_parquet(str(path), engine='pyarrow', nrows=5)
          # Check if ID is in the index
-         if pdf.index.name == 'id' or (pdf.index.dtype in ['int64', 'int32'] and 'id' not in pdf.columns):
+         if pdf.index.name == 'id' or (getattr(pdf.index, 'dtype', None) in ['int64', 'int32'] and 'id' not in pdf.columns):
              logging.info("📊 ID column is in the DataFrame index, will handle accordingly")
              cfg.id_in_index = True
-@@ -589,7 +589,12 @@ def detect_metadata_structure(path: Path, cfg: Config) -> None:
-     # Show sample data for debugging
+         else:
+             cfg.id_in_index = False
+-        # Detect file URL column
+-        file_cols = [col for col in pdf.columns if any(x in col.lower() for x in ['file', 'url', 'path', 'media'])]
+-        if file_cols:
+-            cfg.file_path_col = file_cols[0]
+-            logging.info(f"📁 Using file column: {cfg.file_path_col}")
++        
++        # Detect file URL column with better prioritization
++        # Priority order: file_url > media_asset > file_path > anything with 'url' > anything with 'file'
++        priority_patterns = [
++            ('file_url', lambda c: c.lower() == 'file_url'),
++            ('media_asset', lambda c: 'media_asset' in c.lower()),
++            ('file_path', lambda c: 'file_path' in c.lower()),
++            ('url', lambda c: 'url' in c.lower() and 'file' in c.lower()),
++            ('path', lambda c: 'path' in c.lower() and 'file' in c.lower()),
++            ('url_only', lambda c: 'url' in c.lower()),
++        ]
++        
++        file_col_found = None
++        for pattern_name, pattern_func in priority_patterns:
++            matching_cols = [col for col in pdf.columns if pattern_func(col)]
++            if matching_cols:
++                # Skip columns that are clearly not file paths
++                valid_cols = [c for c in matching_cols if not any(skip in c.lower() for skip in ['ext', 'extension', 'size', 'count', 'type'])]
++                if valid_cols:
++                    file_col_found = valid_cols[0]
++                    break
++        
++        if file_col_found:
++            cfg.file_path_col = file_col_found
++            logging.info(f"📁 Using file column: {cfg.file_path_col}")
+         else:
+             cfg.file_path_col = None
+             logging.warning("⚠️ No file URL column found, will rely on ID-based lookup only")
+@@ -589,33 +609,6 @@ def stream_filtered_metadata(path: Path, cfg: Config, stop_handler: Optional[So
+     """
+     # Build lazy frame
      lf = pl.scan_parquet(str(path))
--    sample = lf.head(2).collect()
-+    try:
-+        sample = lf.head(2).collect()
-+    except Exception as e:
-+        logging.warning(f"⚠️ Could not collect sample: {e}")
-+        # Try without streaming
-+        sample = pl.read_parquet(str(path), n_rows=2)
-     logging.info(f"📋 Available columns: {sample.columns[:10]}...")
-     logging.info(f"📋 Sample row:\n{sample.head(1)}")
- 
-@@ -614,6 +619,7 @@ def stream_filtered_metadata(path: Path, cfg: Config, stop_handler: Optional[So
-                 pdf = pdf.rename(columns={'index': 'id'})
-         # Convert to polars
-         df_full = pl.from_pandas(pdf)
-         lf = df_full.lazy()
-+        logging.info(f"📊 Loaded {len(df_full):,} total rows from pandas conversion")
+-
+-    # Handle case where ID is in index (pandas-style parquet)
+-    if getattr(cfg, 'id_in_index', False):
+-        logging.info("🔄 Converting index-based ID to column...")
+-        import pandas as pd
+-        pdf = pd.read_parquet(str(path))
+-        # Reset index if needed so that ID becomes a column
+-        if pdf.index.name == 'id' or 'id' not in pdf.columns:
+-            pdf = pdf.reset_index()
+-            if 'index' in pdf.columns and 'id' not in pdf.columns:
+-                pdf = pdf.rename(columns={'index': 'id'})
+-        df_full = pl.from_pandas(pdf)
+-        lf = df_full.lazy()
+-        logging.info(f"📊 Loaded {len(df_full):,} total rows from pandas conversion")
      
      # Apply columns selection
      cols_to_load: set[str] = set()
-@@ -854,7 +860,11 @@ def stream_filtered_metadata(path: Path, cfg: Config, stop_handler: Optional[So
-     # Get available columns
--    available_cols = set(lf.schema.keys())
-+    try:
-+        available_cols = set(lf.collect_schema().keys())
-+    except Exception:
-+        # Fallback: collect small sample to get schema
-+        available_cols = set(lf.head(1).collect().columns)
-     final_cols = list(cols_to_load.intersection(available_cols))
+@@ -1204,86 +1197,6 @@ def process_extractions_streaming(metadata_stream: Iterator[Dict[str, Any]],
+             logging.error(f"⚠️ WARNING: {len(pending_extractions)} files were not processed!")
  
-     # md5 is optional
-@@ -917,18 +927,33 @@ def stream_filtered_metadata(path: Path, cfg: Config, stop_handler: Optional[So
-     
-     try:
-         logging.info(f"🔥 Starting streaming collection with batch size {cfg.batch_size}")
+ 
+-def process_extractions_tar_major(metadata_stream: Iterator[Dict[str, Any]],
+-                                  cfg: Config, dest_dir: Path,
+-                                  tar_index,
+-                                  stop_handler: Optional[Any] = None) -> None:
+-    """Accumulate rows per tar and process each tar in chunky batches to avoid open/close thrash."""
+-    # Initialize sharding
+-    sharding = DirectorySharding(dest_dir, cfg.files_per_shard)
 -
--        # Collect the filtered data with streaming.
-+        
-+        # Try different collection strategies
-+        df = None
-         try:
--            df = lf.collect(engine="streaming")  # new API
--        except TypeError:
--            df = lf.collect(streaming=True)      # fallback for older Polars
--        except Exception as e:
--            logging.error(f"❌ Failed to collect with streaming: {e}")
--            logging.info("🔄 Falling back to regular collect...")
--            df = lf.collect()
-+            # First try: streaming with new API
-+            df = lf.collect(streaming=True)
-+            logging.info("✅ Using streaming collection")
-+        except Exception as e1:
-+            logging.warning(f"⚠️ Streaming collection failed: {e1}")
-+            try:
-+                # Second try: regular collect
-+                logging.info("🔄 Trying regular collection...")
-+                df = lf.collect()
-+                logging.info("✅ Using regular collection")
-+            except Exception as e2:
-+                logging.warning(f"⚠️ Regular collection failed: {e2}")
-+                # Final fallback: read directly with chunking
-+                logging.info("🔄 Using direct parquet read with chunking...")
-+                df = pl.read_parquet(str(path))
-+                # Apply same column selection and filters
-+                if final_cols:
-+                    df = df.select(final_cols)
-+                filter_expr = build_polars_filter_expr(cfg)
-+                df = df.filter(filter_expr)
-+                logging.info("✅ Using direct read")
+-    # Initialize JSON writer if per-image JSON output is enabled
+-    json_writer: Optional[Union[BatchedJSONWriter, AsyncJSONWriter]] = None
+-    if cfg.per_image_json:
+-        if cfg.json_writer_workers and cfg.json_writer_workers > 0:
+-            json_writer = AsyncJSONWriter(workers=cfg.json_writer_workers, enable_fsync=cfg.enable_fsync)
+-        else:
+-            json_writer = BatchedJSONWriter(flush_interval=cfg.json_flush_interval, batch_size=1000, enable_fsync=cfg.enable_fsync)
+-
+-    # Create progress tracker for per-image completion tracking
+-    progress_tracker = ValidatingProgressTracker(dest_dir / "progress.json",
+-                                                 update_interval=cfg.progress_update_interval,
+-                                                 enable_fsync=cfg.enable_fsync)
+-
+-    # Optional validation at start, to clean up or scan existing files
+-    if cfg.validate_on_start:
+-        if cfg.full_scan:
+-            progress_tracker.full_filesystem_scan(sharding)
+-        else:
+-            progress_tracker.validate_files(sharding, auto_clean=True)
+-
+-    # Ensure safe shutdown flush: register hooks on stop_handler
+-    if stop_handler:
+-        if json_writer:
+-            stop_handler.add_flush_hook(lambda: json_writer.close())
+-        stop_handler.add_flush_hook(lambda: progress_tracker.save_final())
+-
+-    # Stats for reporting extraction outcomes
+-    stats: Dict[str, Any] = {
+-        'extracted': 0, 'failed': 0, 'skipped': 0, 'not_found': 0,
+-        'not_found_ids': deque(maxlen=cfg.not_found_max_sample),
+-        'total_bytes_written': 0, 'write_time': 0.0
+-    }
+-    stats_lock = threading.Lock()
+-    reporter = ProgressReporter(interval=10.0)
+-
+-    logging.info("🔄 Starting TAR-major extraction…")
+-
+-    # Accumulate rows per tar; each key is tar_name mapping to list of (image_id, filename, metadata)
+-    buckets: Dict[str, List[Tuple[int, str, Dict[str, Any]]]] = defaultdict(list)
+-    # Determine threshold for flushing a tar bucket; ensure at least 50 to reduce thrashing
+-    target_batch = max(50, cfg.batch_size)
+-
+-    # Helper to process a single tar once enough rows accumulate
+-    def flush_tar(tar_name: str) -> None:
+-        items = buckets.get(tar_name, [])
+-        if not items:
+-            return
+-        # Process the tar via existing handler; this writes files and updates stats
+-        process_single_tar(cfg, tar_name, items, sharding, progress_tracker, json_writer,
+-                           tar_index, stats, stats_lock)
+-        # Clear the bucket for this tar
+-        buckets[tar_name].clear()
+-        # Periodically report progress
+-        if reporter.should_report():
+-            reporter.report(stats)
+-
+-    # Iterate through metadata rows, bucketizing by tar
+-    for row in metadata_stream:
+-        # Allow for graceful shutdown via stop_handler
+-        if stop_handler and stop_handler.should_stop():
+-            logging.info("🛑 Stopping due to interrupt…")
+-            break
+-
+-        image_id = row[cfg.id_col]
+-
+-        # Skip if already completed or exists in destination
+-        if progress_tracker.is_completed(image_id):
+-            with stats_lock:
+-                stats['skipped'] += 1
+-            continue
+-        exists, _ = sharding.file_exists(image_id)
+-        if exists:
+-            progress_tracker.mark_completed(image_id)
+-            with stats_lock:
+-                stats['skipped'] += 1
+-            continue
+-
+-        # Determine which tar and filename contain this image
+-        file_url = row.get(cfg.file_path_col, "") if cfg.file_path_col else ""
+-        tar_info = tar_index.find_image(image_id, file_url, row.get(cfg.md5_col))
+-        if not tar_info:
+-            with stats_lock:
+-                stats['not_found'] += 1
+-                stats['not_found_ids'].append(image_id)
+-            continue
+-
+-        tar_name, filename = tar_info
+-        buckets[tar_name].append((image_id, filename, row))
+-
+-        # If this tar bucket has reached the threshold, flush it
+-        if len(buckets[tar_name]) >= target_batch:
+-            flush_tar(tar_name)
+-
+-    # Final flush for any remaining buckets once streaming is finished
+-    for tar_name, items in list(buckets.items()):
+-        if items:
+-            logging.info(f"📦 Finalizing {tar_name} with {len(items)} files…")
+-            flush_tar(tar_name)
+-
+-    # Final reporting and cleanup
+-    reporter.report(stats, force=True)
+-    if json_writer:
+-        json_writer.close()
+-    progress_tracker.save_final()
+ def process_extractions_simple(metadata_stream: Iterator[Dict[str, Any]],
+                               cfg: Config, dest_dir: Path,
+                               tar_index,
+@@ -1658,8 +1571,6 @@ def build_cli() -> argparse.ArgumentParser:
+     p.add_argument("--io-workers", type=int, help="Number of I/O workers")
+     p.add_argument("--batch-size", type=int, help="Streaming batch size")
+     p.add_argument("--use-tar-streaming", action="store_true", help="Use streaming mode for large tars to reduce memory")
+-    p.add_argument("--tar-major", action="store_true", help="Batch by tar (accumulate and process per-tar to reduce open/close thrash)")
  
-         total_rows = len(df)
-         logging.info(f"📊 Filtered metadata contains {total_rows:,} matching images")
+     # Additional tuning options
+     p.add_argument(
+@@ -1741,10 +1652,6 @@ def apply_cli_overrides(args: argparse.Namespace, cfg: Config) -> None:
+         cfg.batch_size = args.batch_size
+     if hasattr(args, 'use_tar_streaming') and args.use_tar_streaming:
+         cfg.use_tar_streaming = True
+-
+-    # Toggle tar-major batching mode
+-    if hasattr(args, 'tar_major') and args.tar_major:
+-        cfg.tar_major = True
+ 
+     # New configurable fields
+     if hasattr(args, 'progress_update_interval') and args.progress_update_interval is not None:
+@@ -1859,11 +1766,7 @@ def main() -> None:
          
-         if total_rows == 0:
-             logging.warning("⚠️ No images match the filter criteria!")
-@@ -936,10 +961,17 @@ def stream_filtered_metadata(path: Path, cfg: Config, stop_handler: Optional[So
- 
-         # Iterate over the collected DataFrame in batches.
-         batch_count = 0
-         total_yielded = 0
--        for batch_df in df.iter_slices(cfg.batch_size):
-+        
-+        # Use iter_slices for memory efficiency
-+        slice_size = min(cfg.batch_size, 10000)  # Cap slice size for safety
-+        
-+        for batch_df in df.iter_slices(slice_size):
-             batch_count += 1
--            if batch_count % 10 == 0:
--                logging.info(f"📊 Processing batch {batch_count} ({total_yielded:,}/{total_rows:,} items)...")
-+            
-+            # More frequent progress updates for large datasets
-+            if batch_count % 5 == 0 or total_yielded == 0:
-+                progress_pct = (total_yielded / total_rows * 100) if total_rows > 0 else 0
-+                logging.info(f"📊 Processing batch {batch_count} ({total_yielded:,}/{total_rows:,} items - {progress_pct:.1f}%)...")
- 
-             # Check for stop signal
-             if stop_handler and stop_handler.should_stop():
-@@ -2041,6 +2073,18 @@ def main() -> None:
-     
-     out_dir.mkdir(parents=True, exist_ok=True)
-     
-+    # Check Polars version and settings
-+    try:
-+        import polars as pl
-+        pl_version = pl.__version__
-+        logging.info(f"📦 Using Polars version: {pl_version}")
-+        
-+        # Set Polars to use all available cores
-+        import os
-+        os.environ["POLARS_MAX_THREADS"] = str(os.cpu_count())
-+    except Exception as e:
-+        logging.warning(f"⚠️ Could not check Polars version: {e}")
-+    
-     # Auto-detect metadata structure
-     detect_metadata_structure(meta_path, cfg)
+         # Process extractions
+         if cfg.extract_images:
+-            # Use TAR-major mode when configured; otherwise fallback to simple streaming extraction
+-            if getattr(cfg, "tar_major", False):
+-                process_extractions_tar_major(metadata_stream, cfg, out_dir, tar_index, stop_handler)
+-            else:
+-                process_extractions_simple(metadata_stream, cfg, out_dir, tar_index, stop_handler)
++            process_extractions_simple(metadata_stream, cfg, out_dir, tar_index, stop_handler)
+         else:
+             logging.info("🔄 Filtering metadata only (extraction disabled)")
+             count = sum(1 for _ in metadata_stream)

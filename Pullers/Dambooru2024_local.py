@@ -672,7 +672,7 @@ def build_polars_filter_expr(cfg: Config) -> pl.Expr:
                 pattern = create_tag_pattern(char)
                 char_filters.append(pl.col(cfg.character_tags_col).str.contains(pattern))
             if char_filters:
-                filters.append(pl.any_horizontal(char_filters))
+                filters.append(pl.any_horizontal(*char_filters))
         
         if cfg.exclude_characters:
             for char in cfg.exclude_characters:
@@ -687,7 +687,7 @@ def build_polars_filter_expr(cfg: Config) -> pl.Expr:
                 pattern = create_tag_pattern(copy)
                 copy_filters.append(pl.col(cfg.copyright_tags_col).str.contains(pattern))
             if copy_filters:
-                filters.append(pl.any_horizontal(copy_filters))
+                filters.append(pl.any_horizontal(*copy_filters))
         
         if cfg.exclude_copyrights:
             for copy in cfg.exclude_copyrights:
@@ -702,7 +702,7 @@ def build_polars_filter_expr(cfg: Config) -> pl.Expr:
                 pattern = create_tag_pattern(artist)
                 artist_filters.append(pl.col(cfg.artist_tags_col).str.contains(pattern))
             if artist_filters:
-                filters.append(pl.any_horizontal(artist_filters))
+                filters.append(pl.any_horizontal(*artist_filters))
         
         if cfg.exclude_artists:
             for artist in cfg.exclude_artists:
@@ -733,7 +733,7 @@ def build_polars_filter_expr(cfg: Config) -> pl.Expr:
             elif rating_lower in ["explicit", "e"]:
                 rating_filters.append(rate_col.is_in(["explicit", "e"]))
         if rating_filters:
-            filters.append(pl.any_horizontal(rating_filters))
+            filters.append(pl.any_horizontal(*rating_filters))
     
     # Dimension filtering
     if cfg.enable_dimension_filtering:
@@ -755,24 +755,44 @@ def build_polars_filter_expr(cfg: Config) -> pl.Expr:
     # Combine all filters
     if not filters:
         return pl.lit(True)
-    return pl.all_horizontal(filters)
+    return pl.all_horizontal(*filters)
 
 def detect_metadata_structure(path: Path, cfg: Config) -> None:
     """Auto-detect metadata structure and update config accordingly."""
     logging.info("🔍 Detecting metadata structure...")
     try:
         import pandas as pd
-        pdf = pd.read_parquet(str(path), engine='pyarrow').head(5)
+        # Only read first few rows for structure detection
+        pdf = pd.read_parquet(str(path), engine='pyarrow', nrows=5)
         # Check if ID is in the index
         if pdf.index.name == 'id' or (getattr(pdf.index, 'dtype', None) in ['int64', 'int32'] and 'id' not in pdf.columns):
             logging.info("📊 ID column is in the DataFrame index, will handle accordingly")
             cfg.id_in_index = True
         else:
             cfg.id_in_index = False
-        # Detect file URL column
-        file_cols = [col for col in pdf.columns if any(x in col.lower() for x in ['file', 'url', 'path', 'media'])]
-        if file_cols:
-            cfg.file_path_col = file_cols[0]
+        # Detect file URL column with better prioritization
+        # Priority order: file_url > media_asset > file_path > anything with 'url' > anything with 'file'
+        priority_patterns = [
+            ('file_url', lambda c: c.lower() == 'file_url'),
+            ('media_asset', lambda c: 'media_asset' in c.lower()),
+            ('file_path', lambda c: 'file_path' in c.lower()),
+            ('url', lambda c: 'url' in c.lower() and 'file' in c.lower()),
+            ('path', lambda c: 'path' in c.lower() and 'file' in c.lower()),
+            ('url_only', lambda c: 'url' in c.lower()),
+        ]
+
+        file_col_found = None
+        for pattern_name, pattern_func in priority_patterns:
+            matching_cols = [col for col in pdf.columns if pattern_func(col)]
+            if matching_cols:
+                # Skip columns that are clearly not file paths
+                valid_cols = [c for c in matching_cols if not any(skip in c.lower() for skip in ['ext', 'extension', 'size', 'count', 'type'])]
+                if valid_cols:
+                    file_col_found = valid_cols[0]
+                    break
+
+        if file_col_found:
+            cfg.file_path_col = file_col_found
             logging.info(f"📁 Using file column: {cfg.file_path_col}")
         else:
             cfg.file_path_col = None
@@ -802,19 +822,7 @@ def stream_filtered_metadata(path: Path, cfg: Config, stop_handler: Optional[Sof
     # Build lazy frame
     lf = pl.scan_parquet(str(path))
 
-    # Handle case where ID is in index (pandas-style parquet)
-    if getattr(cfg, 'id_in_index', False):
-        logging.info("🔄 Converting index-based ID to column...")
-        import pandas as pd
-        pdf = pd.read_parquet(str(path))
-        # Reset index if needed so that ID becomes a column
-        if pdf.index.name == 'id' or 'id' not in pdf.columns:
-            pdf = pdf.reset_index()
-            if 'index' in pdf.columns and 'id' not in pdf.columns:
-                pdf = pdf.rename(columns={'index': 'id'})
-        df_full = pl.from_pandas(pdf)
-        lf = df_full.lazy()
-        logging.info(f"📊 Loaded {len(df_full):,} total rows from pandas conversion")
+    # Handle case where ID is in index is no longer needed; rely on polars lazy scan only
     
     # Apply columns selection
     cols_to_load: set[str] = set()
@@ -1223,7 +1231,7 @@ def build_cli() -> argparse.ArgumentParser:
     p.add_argument("--io-workers", type=int, help="Number of I/O workers")
     p.add_argument("--batch-size", type=int, help="Streaming batch size")
     p.add_argument("--use-tar-streaming", action="store_true", help="Use streaming mode for large tars to reduce memory")
-    p.add_argument("--tar-major", action="store_true", help="Batch by tar (accumulate and process per-tar to reduce open/close thrash)")
+    # removed tar-major option; tar-major extraction is no longer supported
 
     # Additional tuning options
     p.add_argument(
@@ -1342,9 +1350,7 @@ def apply_cli_overrides(args: argparse.Namespace, cfg: Config) -> None:
     if hasattr(args, 'use_tar_streaming') and args.use_tar_streaming:
         cfg.use_tar_streaming = True
 
-    # Toggle tar-major batching mode
-    if hasattr(args, 'tar_major') and args.tar_major:
-        cfg.tar_major = True
+    # tar-major batching mode removed; always use simple streaming extraction
 
     # New configurable fields
     if hasattr(args, 'progress_update_interval') and args.progress_update_interval is not None:
@@ -2096,11 +2102,8 @@ def main() -> None:
         
         # Process extractions
         if cfg.extract_images:
-            # Use TAR-major mode when configured; otherwise fallback to simple streaming extraction
-            if getattr(cfg, "tar_major", False):
-                process_extractions_tar_major(metadata_stream, cfg, out_dir, tar_index, stop_handler)
-            else:
-                process_extractions_simple(metadata_stream, cfg, out_dir, tar_index, stop_handler)
+            # Always use the streaming extraction; tar-major mode has been removed
+            process_extractions_simple(metadata_stream, cfg, out_dir, tar_index, stop_handler)
         else:
             logging.info("📄 Filtering metadata only (extraction disabled)")
             count = sum(1 for _ in metadata_stream)
