@@ -53,10 +53,8 @@ class Config:
     rating_col: str = "rating"
     width_col: str = "image_width"
     height_col: str = "image_height"
-    file_path_col: str = "file_url"
-    file_id_col: str = "media_asset.id"  # Not used - kept for compatibility
+    file_path_col: Optional[str] = None  # Auto-detect from available columns
     id_col: str = "id"  # Primary ID for both finding files and metadata association
-    # Some mirrors include md5 in metadata; if present we use it for robust lookup
     md5_col: str = "md5"
 
     # ---- Filtering (unchanged) --------------------------------------------
@@ -581,7 +579,7 @@ class SoftStopHandler:
 # ---------------------------------------------------------------------------
 def prepare_json_data(row: Dict[str, Any], cfg: Config) -> Dict[str, Any]:
     """Prepare JSON metadata for a single image."""
-    file_url = row.get(cfg.file_path_col, "")
+    file_url = row.get(cfg.file_path_col, "") if cfg.file_path_col else ""
     ext = os.path.splitext(file_url)[-1].lower() or ".jpg"
     if ext not in [".jpg", ".jpeg", ".png", ".webp", ".gif"]:
         ext = ".jpg"
@@ -759,6 +757,43 @@ def build_polars_filter_expr(cfg: Config) -> pl.Expr:
         return pl.lit(True)
     return pl.all_horizontal(filters)
 
+def detect_metadata_structure(path: Path, cfg: Config) -> None:
+    """Auto-detect metadata structure and update config accordingly."""
+    logging.info("🔍 Detecting metadata structure...")
+    try:
+        import pandas as pd
+        pdf = pd.read_parquet(str(path), engine='pyarrow').head(5)
+        # Check if ID is in the index
+        if pdf.index.name == 'id' or (getattr(pdf.index, 'dtype', None) in ['int64', 'int32'] and 'id' not in pdf.columns):
+            logging.info("📊 ID column is in the DataFrame index, will handle accordingly")
+            cfg.id_in_index = True
+        else:
+            cfg.id_in_index = False
+        # Detect file URL column
+        file_cols = [col for col in pdf.columns if any(x in col.lower() for x in ['file', 'url', 'path', 'media'])]
+        if file_cols:
+            cfg.file_path_col = file_cols[0]
+            logging.info(f"📁 Using file column: {cfg.file_path_col}")
+        else:
+            cfg.file_path_col = None
+            logging.warning("⚠️ No file URL column found, will rely on ID-based lookup only")
+    except Exception as e:
+        logging.warning(f"⚠️ Could not detect structure with pandas: {e}")
+        cfg.id_in_index = False
+    # Show sample data for debugging
+    try:
+        lf = pl.scan_parquet(str(path))
+        try:
+            sample = lf.head(2).collect()
+        except Exception as e:
+            logging.warning(f"⚠️ Could not collect sample: {e}")
+            # Try without streaming
+            sample = pl.read_parquet(str(path), n_rows=2)
+        logging.info(f"📋 Available columns: {sample.columns[:10]}...")
+        logging.info(f"📋 Sample row:\n{sample.head(1)}")
+    except Exception as e:
+        logging.debug(f"Failed to collect sample metadata: {e}")
+
 def stream_filtered_metadata(path: Path, cfg: Config, stop_handler: Optional[SoftStopHandler] = None) -> Iterator[Dict[str, Any]]:
     """
     Streams filtered metadata using collect(streaming=True) for constant memory.
@@ -766,12 +801,28 @@ def stream_filtered_metadata(path: Path, cfg: Config, stop_handler: Optional[Sof
     """
     # Build lazy frame
     lf = pl.scan_parquet(str(path))
+
+    # Handle case where ID is in index (pandas-style parquet)
+    if getattr(cfg, 'id_in_index', False):
+        logging.info("🔄 Converting index-based ID to column...")
+        import pandas as pd
+        pdf = pd.read_parquet(str(path))
+        # Reset index if needed so that ID becomes a column
+        if pdf.index.name == 'id' or 'id' not in pdf.columns:
+            pdf = pdf.reset_index()
+            if 'index' in pdf.columns and 'id' not in pdf.columns:
+                pdf = pdf.rename(columns={'index': 'id'})
+        df_full = pl.from_pandas(pdf)
+        lf = df_full.lazy()
+        logging.info(f"📊 Loaded {len(df_full):,} total rows from pandas conversion")
     
     # Apply columns selection
     cols_to_load: set[str] = set()
     
     # Always load ID and file path for extraction
-    cols_to_load.update([cfg.id_col, cfg.file_path_col])
+    cols_to_load.add(cfg.id_col)
+    if cfg.file_path_col:
+        cols_to_load.add(cfg.file_path_col)
     
     # Load columns needed for filtering
     if cfg.enable_include_tags or cfg.enable_exclude_tags:
@@ -806,14 +857,18 @@ def stream_filtered_metadata(path: Path, cfg: Config, stop_handler: Optional[Sof
         ])
     
     # Get available columns
-    available_cols = set(lf.schema.keys())
+    try:
+        # Prefer using collect_schema for robust schema retrieval
+        available_cols = set(lf.collect_schema().keys())
+    except Exception:
+        # Fallback: collect small sample to get schema
+        available_cols = set(lf.head(1).collect().columns)
     final_cols = list(cols_to_load.intersection(available_cols))
 
-    # md5 is optional; if present we’ll include it and pass it to TarIndex
-    # (some Danbooru mirrors name files by md5). We'll add it to the selection once we know it exists.
-    wants_md5 = cfg.md5_col
-    if wants_md5 and wants_md5 in available_cols:
-        final_cols.append(wants_md5)
+    # md5 is optional
+    if cfg.md5_col and cfg.md5_col in available_cols:
+        final_cols.append(cfg.md5_col)
+        logging.info(f"✅ MD5 column '{cfg.md5_col}' found and will be used")
 
     if final_cols:
         lf = lf.select(final_cols)
@@ -872,30 +927,59 @@ def stream_filtered_metadata(path: Path, cfg: Config, stop_handler: Optional[Sof
     
     try:
         logging.info(f"🔥 Starting streaming collection with batch size {cfg.batch_size}")
-
-        # Collect the filtered data with streaming.
+        # Try different collection strategies
+        df = None
         try:
-            df = lf.collect(engine="streaming")  # new API
-        except TypeError:
-            df = lf.collect(streaming=True)      # fallback for older Polars
+            # First try: streaming collection
+            df = lf.collect(streaming=True)
+            logging.info("✅ Using streaming collection")
+        except Exception as e1:
+            logging.warning(f"⚠️ Streaming collection failed: {e1}")
+            try:
+                # Second try: regular collection
+                logging.info("🔄 Trying regular collection...")
+                df = lf.collect()
+                logging.info("✅ Using regular collection")
+            except Exception as e2:
+                logging.warning(f"⚠️ Regular collection failed: {e2}")
+                # Final fallback: read directly with chunking
+                logging.info("🔄 Using direct parquet read with chunking...")
+                df = pl.read_parquet(str(path))
+                # Apply same column selection and filters
+                if final_cols:
+                    df = df.select(final_cols)
+                filter_expr = build_polars_filter_expr(cfg)
+                df = df.filter(filter_expr)
+                logging.info("✅ Using direct read")
 
-        # Iterate over the collected DataFrame in batches.
+        total_rows = len(df)
+        logging.info(f"📊 Filtered metadata contains {total_rows:,} matching images")
+        if total_rows == 0:
+            logging.warning("⚠️ No images match the filter criteria!")
+            return
+
         batch_count = 0
         total_yielded = 0
-        for batch_df in df.iter_slices(cfg.batch_size):
+        # Use iter_slices for memory efficiency
+        slice_size = min(cfg.batch_size, 10000)
+        for batch_df in df.iter_slices(slice_size):
             batch_count += 1
-            if batch_count % 10 == 0:
-                logging.info(f"📊 Processing batch {batch_count} ({total_yielded:,} items so far)...")
+            # More frequent progress updates for large datasets
+            if batch_count % 5 == 0 or total_yielded == 0:
+                progress_pct = (total_yielded / total_rows * 100) if total_rows > 0 else 0
+                logging.info(f"📊 Processing batch {batch_count} ({total_yielded:,}/{total_rows:,} items - {progress_pct:.1f}%)...")
 
             # Check for stop signal
             if stop_handler and stop_handler.should_stop():
                 logging.info("🛑 Stopping stream due to user interrupt...")
                 break
 
-            # Yield each row in the batch
             for row in batch_df.iter_rows(named=True):
                 total_yielded += 1
                 yield row
+
+        if total_yielded > 0:
+            logging.info(f"✅ Streamed {total_yielded:,} filtered items")
 
     except Exception as e:
         logging.error(f"❌ Error during streaming: {e}")
@@ -912,9 +996,6 @@ class TarIndex:
         # Primary numeric-id index
         self.index: Dict[int, str] = {}       # {file_id: tar_name}
         self.index_paths: Dict[int, str] = {}  # {file_id: internal path within tar}
-        # Supplemental indices for mirrors that use md5-based naming
-        self.basename_index: Dict[str, Tuple[str, str]] = {}  # {'md5.ext': (tar, fullpath)}
-        self.md5_index: Dict[str, Tuple[str, str]] = {}       # {'32hex': (tar, fullpath)}
         self.lock = threading.Lock()
         
         # Use the existing cache that's already built
@@ -971,21 +1052,9 @@ class TarIndex:
             self._build_from_json_files()
 
     def _extract_id_from_key(self, key: str) -> Optional[int]:
-        """Extract numeric file ID from a manifest key like '123456.png' or 'subdir/123456.webp'.
-
-        This helper safely parses a string key to pull out the numeric identifier before any
-        directory segments or file extensions. If the key does not end with a numeric stem,
-        ``None`` is returned instead of raising an exception.
-
-        Args:
-            key: The manifest key, which may include path separators and a file extension.
-
-        Returns:
-            The integer file ID if it can be parsed, otherwise ``None``.
-        """
+        """Extract numeric file ID from a manifest key."""
         if not isinstance(key, str):
             return None
-        # Only consider the last path component and drop the extension
         base = key.rsplit('/', 1)[-1]
         stem = base.split('.', 1)[0]
         try:
@@ -993,89 +1062,25 @@ class TarIndex:
         except ValueError:
             return None
 
-    def _extract_md5_from_basename(self, basename: str) -> Optional[str]:
-        """
-        If basename looks like '<md5>.<ext>' where <md5> is 32 hex chars, return the md5.
-        Otherwise return None.
-        """
-        if not isinstance(basename, str):
-            return None
-        name_only = basename.rsplit('/', 1)[-1]
-        stem = name_only.split('.', 1)[0]
-        if len(stem) == 32:
-            try:
-                int(stem, 16)
-                return stem.lower()
-            except ValueError:
-                return None
-        return None
-
-    def _iter_manifest_keys(self, data: Any):
-        """Yield possible file path keys from a variety of WebDataset-style manifests.
-
-        This method supports several manifest shapes commonly used by WebDataset and similar
-        tools. It will gracefully handle dictionaries and lists, looking for keys in
-        ``files`` dicts or lists, ``keys`` lists, lists of ``entries``/``samples`` with
-        ``path``, ``name``, ``key`` or ``filename`` fields. As a fallback it yields any
-        string values contained directly within the top-level collection. If the input
-        structure is not iterable or does not match known patterns, the method quietly
-        returns without yielding anything.
-
-        Args:
-            data: Parsed JSON data which may be a dictionary or list representing a manifest.
-
-        Yields:
-            Strings representing potential file paths inside the tar.
-        """
-        try:
-            # Dictionaries have specific structures we can handle
-            if isinstance(data, dict):
-                # WebDataset: {'files': {<path>: ...}}
-                if isinstance(data.get('files'), dict):
-                    for k in data['files'].keys():
-                        if isinstance(k, str):
-                            yield k
-                    return
-                # WebDataset alt: {'files': [<path>, ...]}
-                if isinstance(data.get('files'), list):
-                    for k in data['files']:
-                        if isinstance(k, str):
-                            yield k
-                # Generic: {'keys': [<path>, ...]}
-                if isinstance(data.get('keys'), list):
-                    for k in data['keys']:
-                        if isinstance(k, str):
-                            yield k
-                # Other manifest shapes: entries with path/name/key
-                if isinstance(data.get('entries'), list):
-                    for e in data['entries']:
-                        if isinstance(e, dict):
-                            k = e.get('path') or e.get('name') or e.get('key')
-                            if isinstance(k, str):
-                                yield k
-                # Another shape: samples with key/filename
-                if isinstance(data.get('samples'), list):
-                    for s in data['samples']:
-                        if isinstance(s, dict):
-                            k = s.get('key') or s.get('filename')
-                            if isinstance(k, str):
-                                yield k
-                # Fallback: iterate over direct string values in dict
-                for v in data.values():
-                    if isinstance(v, str):
-                        yield v
-                    elif isinstance(v, list):
-                        for x in v:
-                            if isinstance(x, str):
-                                yield x
-            # If the data is a simple list, yield string elements
-            elif isinstance(data, list):
-                for k in data:
-                    if isinstance(k, str):
-                        yield k
-        except Exception:
-            # Silently ignore malformed structures
-            return
+    def _parse_manifest(self, data: Any) -> List[str]:
+        """Parse manifest data and return list of file paths."""
+        paths: List[str] = []
+        if isinstance(data, dict):
+            # Most common: dict with numeric keys or 'files' key
+            if 'files' in data:
+                if isinstance(data['files'], dict):
+                    paths.extend(data['files'].keys())
+                elif isinstance(data['files'], list):
+                    paths.extend(data['files'])
+            else:
+                # Try direct numeric keys (common in Danbooru dumps)
+                for k in data.keys():
+                    if k.isdigit() or '.' in k:
+                        paths.append(k)
+        elif isinstance(data, list):
+            # Simple list of filenames
+            paths.extend([str(x) for x in data if x])
+        return paths
     
     def _build_from_json_files(self):
         """Build index from the JSON files next to tar files."""
@@ -1085,130 +1090,75 @@ class TarIndex:
             logging.warning(f"⚠️ No tar files found in {self.source_dir}")
             return
 
+        total_mapped = 0
+        sample_shown = False
+
         for tar_path in tar_files:
             tar_name = tar_path.name
             json_path = tar_path.with_suffix('.json')
             if not json_path.exists():
-                logging.warning(f"No JSON for {tar_name}")
+                logging.debug(f"No JSON for {tar_name}")
                 continue
             try:
                 with open(json_path, 'r', encoding='utf-8') as f:
                     data = json.load(f)
-                for key in self._iter_manifest_keys(data):
-                    # Always record basename-based index
-                    base = key.rsplit('/', 1)[-1]
-                    self.basename_index[base] = (tar_name, key)
-                    # Optional: md5 index (for mirrors with md5 filenames)
-                    md5 = self._extract_md5_from_basename(base)
-                    if md5:
-                        self.md5_index[md5] = (tar_name, key)
 
-                    # Primary numeric-id index (when keys end with numeric id)
-                    fid = self._extract_id_from_key(key)
+                # Show structure of first JSON for debugging
+                if not sample_shown:
+                    logging.info(f"🔍 Sample JSON structure from {json_path.name}:")
+                    if isinstance(data, dict):
+                        logging.info(f"   Type: dict with {len(data)} keys")
+                        sample_keys = list(data.keys())[:5]
+                        logging.info(f"   Sample keys: {sample_keys}")
+                    elif isinstance(data, list):
+                        logging.info(f"   Type: list with {len(data)} items")
+                        logging.info(f"   Sample items: {data[:5]}")
+                    sample_shown = True
+
+                # Parse paths from manifest
+                paths = self._parse_manifest(data)
+
+                for path in paths:
+                    fid = self._extract_id_from_key(path)
                     if fid is not None:
                         self.index[fid] = tar_name
-                        self.index_paths[fid] = key  # remember full internal path
+                        self.index_paths[fid] = path
+                        total_mapped += 1
             except Exception as e:
                 logging.error(f"Failed to process {json_path}: {e}")
 
-        logging.info(f"✅ Built index with {len(self.index):,} file ID mappings")
+        logging.info(f"✅ Built index with {len(self.index):,} file ID mappings from {len(tar_files)} tar files")
+
+        # Show sample mappings for debugging
+        if self.index:
+            sample = list(self.index.items())[:5]
+            logging.info("📋 Sample ID mappings:")
+            for fid, tar in sample:
+                path = self.index_paths.get(fid, f"{fid}.jpg")
+                logging.info(f"   ID {fid} -> {tar} (path: {path})")
     
-    def find_image(self, image_id: int, file_url: str = "", md5: Optional[str] = None
-                   ) -> Optional[Tuple[str, str]]:
-        """
-        Resolve an image to (tar_name, internal_path) using multiple strategies:
-        1) numeric id mapping (fast path)
-        2) explicit md5 (from metadata) or md5 derived from file_url
-        3) basename from file_url (e.g., '<md5>.webp')
-        Returns None if no matching entry is found.
-        """
-        internal_path: Optional[str] = None
-        tar_name: Optional[str] = None
-        # 1) direct id mapping
+    def find_image(self, image_id: int, file_url: str = "", md5: Optional[str] = None) -> Optional[Tuple[str, str]]:
+        """Find image by ID in tar files."""
         with self.lock:
             if image_id in self.index:
                 tar_name = self.index[image_id]
-                internal_path = self.index_paths.get(image_id)
+                internal_path = self.index_paths.get(image_id, f"{image_id}.jpg")
+                return (tar_name, internal_path)
 
-        actual_ext: Optional[str] = None
-        # 2) md5 path (explicit or derived from URL)
-        if tar_name is None:
-            # Derive md5 from URL if not provided
-            if not md5 and file_url:
-                try:
-                    url_path = urlparse(file_url).path or file_url
-                except Exception:
-                    url_path = file_url
-                candidate = url_path.rsplit('/', 1)[-1]
-                md5 = self._extract_md5_from_basename(candidate) or md5
-            if md5:
-                with self.lock:
-                    md5_hit = self.md5_index.get(md5)
-                if md5_hit:
-                    tar_name, internal_path = md5_hit
-                    actual_ext = os.path.splitext(internal_path)[1]
+        # Log miss for debugging
+        if len(self.index) > 0:
+            sample_ids = list(self.index.keys())[:3]
+            logging.debug(f"❌ ID {image_id} not in index. Sample IDs: {sample_ids}")
 
-        # 3) basename from URL (if still unresolved)
-        if tar_name is None and file_url:
-            try:
-                url_path = urlparse(file_url).path or file_url
-            except Exception:
-                url_path = file_url
-            base = url_path.rsplit('/', 1)[-1]
-            with self.lock:
-                base_hit = self.basename_index.get(base)
-            if base_hit:
-                tar_name, internal_path = base_hit
-                actual_ext = os.path.splitext(internal_path)[1]
+        return None
 
-        # If still unresolved, and id mapping existed (without stored path), try to discover
-        # the ext/path from the sidecar json lazily (kept from original code)
-        if tar_name and not internal_path:
-            json_path = self.source_dir / tar_name.replace('.tar', '.json')
-            if json_path.exists():
-                try:
-                    with open(json_path, 'r', encoding='utf-8') as f:
-                        data = json.load(f)
-                    for k in self._iter_manifest_keys(data):
-                        if not isinstance(k, str):
-                            continue
-                        base = k.rsplit('/', 1)[-1]
-                        if base.startswith(f"{image_id}."):
-                            actual_ext = os.path.splitext(k)[1]
-                            internal_path = k  # Prefer discovered full path
-                            with self.lock:
-                                self.index_paths[image_id] = internal_path
-                            break
-                except Exception:
-                    pass
-
-        if not tar_name:
-            return None
-
-        # Determine extension
-        actual_ext = actual_ext or None
-        ext = actual_ext or '.jpg'
-        # Try to get extension from URL if none from above
-        if file_url and not actual_ext:
-            ext_match = re.search(r'\.(jpg|jpeg|png|gif|webp)$', file_url, re.IGNORECASE)
-            if ext_match:
-                ext = ext_match.group(0)
-
-        filename_or_path = internal_path if internal_path else f"{image_id}{ext}"
-        return (tar_name, filename_or_path)
-
-    def cache_discovered_path(self, image_id: int, tar_name: str, internal_path: str) -> None:
-        """Cache a discovered full internal path for future lookups."""
-        with self.lock:
-            self.index[image_id] = tar_name
-            self.index_paths[image_id] = internal_path
+    # cache_discovered_path removed; paths are stored directly in save_file
 
     def get_statistics(self) -> Dict[str, Any]:
         """Get index statistics for debugging."""
         stats = {
             'total_images': len(self.index),
-            'basename_entries': len(self.basename_index),
-            'md5_entries': len(self.md5_index),
+            'unique_tars': len(set(self.index.values())) if self.index else 0,
             'sample_mappings': dict(list(self.index.items())[:10]) if self.index else {}
         }
         return stats
@@ -1577,7 +1527,7 @@ def process_extractions_streaming(metadata_stream: Iterator[Dict[str, Any]],
                 continue
 
             # Find tar info
-            file_url = row.get(cfg.file_path_col, "")
+            file_url = row.get(cfg.file_path_col, "") if cfg.file_path_col else ""
             tar_info = tar_index.find_image(image_id, file_url, row.get(cfg.md5_col))
             if not tar_info:
                 with stats_lock:
@@ -1849,7 +1799,7 @@ def process_extractions_tar_major(metadata_stream: Iterator[Dict[str, Any]],
             continue
 
         # Determine which tar and filename contain this image
-        file_url = row.get(cfg.file_path_col, "")
+        file_url = row.get(cfg.file_path_col, "") if cfg.file_path_col else ""
         tar_info = tar_index.find_image(image_id, file_url, row.get(cfg.md5_col))
         if not tar_info:
             with stats_lock:
@@ -2045,8 +1995,8 @@ def save_file(cfg: Config, image_id: int, data: bytes, row: Dict[str, Any], memb
             json_data = prepare_json_data(row, cfg)
             json_writer.add_write(json_path, json_data)
         # Cache discovered path
-        if hasattr(tar_index, 'cache_discovered_path'):
-            tar_index.cache_discovered_path(image_id, tar_name, member.name)
+        with tar_index.lock:
+            tar_index.index_paths[image_id] = member.name
         # Mark completed
         progress_tracker.mark_completed(image_id)
     except Exception as e:
@@ -2099,6 +2049,20 @@ def main() -> None:
         sys.exit(1)
     
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Check Polars version and settings
+    try:
+        import polars as pl
+        pl_version = pl.__version__
+        logging.info(f"📦 Using Polars version: {pl_version}")
+        # Set Polars to use all available cores
+        import os
+        os.environ["POLARS_MAX_THREADS"] = str(os.cpu_count())
+    except Exception as e:
+        logging.warning(f"⚠️ Could not check Polars version: {e}")
+
+    # Auto-detect metadata structure
+    detect_metadata_structure(meta_path, cfg)
     
     # Build tar index
     logging.info("🗂️ Initializing tar index...")
@@ -2109,11 +2073,7 @@ def main() -> None:
     index_stats = tar_index.get_statistics()
     logging.info(f"📊 Index statistics:")
     logging.info(f"   Total indexed file IDs: {index_stats['total_images']:,}")
-    # Additional index statistics if present
-    if 'basename_entries' in index_stats:
-        logging.info(f"   Basename mappings: {index_stats['basename_entries']:,}")
-    if 'md5_entries' in index_stats:
-        logging.info(f"   MD5 mappings: {index_stats['md5_entries']:,}")
+    logging.info(f"   Unique tar files: {index_stats.get('unique_tars', 0)}")
     if index_stats.get('sample_mappings'):
         logging.info(f"   Sample mappings: {index_stats['sample_mappings']}")
     
