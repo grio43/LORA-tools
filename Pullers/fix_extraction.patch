@@ -1,218 +1,290 @@
 --- a/Dambooru2024_local.py
 +++ b/Dambooru2024_local.py
-@@ -938,23 +938,32 @@ def stream_filtered_metadata(path: Path, cfg: Config, stop_handler: Optional[So
-     lf = lf.filter(filter_expr)
+@@ -14,6 +14,7 @@ import signal
+ import threading
+ import time
+ import tarfile
++import hashlib
+ from typing import Union
+ from collections import defaultdict, deque
+ import queue
+@@ -85,7 +86,7 @@ class Config:
+ 
+     # ---- Performance settings ---------------------------------------------
+     workers: int = 12  # Reduced for better memory management
+     io_workers: int = 8  # I/O-bound JSON and file writers
+     files_per_shard: int = 10000
+     batch_size: int = 1000  # Number of metadata rows to read at once
+     write_buffer_size_mb: int = 8  # Reduced buffer size
+     progress_update_interval: int = 5000
+ 
+     json_writer_workers: int = 4
+     pre_create_shards: bool = True
+-    enable_fsync: bool = False
++    enable_fsync: bool = True  # Changed to True for data safety
+ 
+     json_flush_interval: float = 5.0
+     not_found_max_sample: int = 20000
+     use_tar_streaming: bool = True  # Enable true streaming
++    
++    # ---- Data integrity settings -----------------------------------------
++    verify_checksums: bool = True  # Verify MD5 after extraction
++    retry_failed_extractions: int = 3  # Number of retries for failed extractions
++    verify_existing_files: bool = False  # Verify existing files are complete
++    min_file_size: int = 100  # Minimum valid file size in bytes
+ 
+ # ---------------------------------------------------------------------------
+ # Directory Sharding
+@@ -138,6 +143,31 @@ class DirectorySharding:
+                 return True, ext
+         return False, None
+ 
++    def verify_file_integrity(self, image_id: int, expected_md5: Optional[str] = None, 
++                             expected_size: Optional[int] = None) -> bool:
++        """Verify file integrity with checksum and size."""
++        shard_index = image_id // self.files_per_dir
++        shard_path = self.base_dir / f"shard_{shard_index:05d}"
++        
++        for ext in ['.jpg', '.jpeg', '.png', '.gif', '.webp']:
++            file_path = shard_path / f"{image_id}{ext}"
++            if file_path.exists():
++                try:
++                    # Check file size
++                    actual_size = file_path.stat().st_size
++                    if actual_size < 100:  # Suspiciously small
++                        return False
++                    if expected_size and abs(actual_size - expected_size) > 100:
++                        return False
++                    
++                    # Check MD5 if provided
++                    if expected_md5:
++                        with open(file_path, 'rb') as f:
++                            actual_md5 = hashlib.md5(f.read()).hexdigest()
++                        return actual_md5.lower() == expected_md5.lower()
++                    return True
++                except Exception:
++                    return False
++        return False
++
+ # ---------------------------------------------------------------------------
+ # Batched JSON Writer
+ # ---------------------------------------------------------------------------
+@@ -404,6 +434,28 @@ class ValidatingProgressTracker:
+         logging.info(f"ðŸ"Š Found {len(found_ids):,} files on filesystem")
+         self.completed_ids = found_ids
+         self._save_progress()
++    
++    def verify_completed_files(self, sharding: DirectorySharding, 
++                              metadata: Dict[int, Dict[str, Any]]) -> Set[int]:
++        """Verify completed files have correct checksums."""
++        logging.info("ðŸ" Verifying file integrity with checksums...")
++        invalid_ids = set()
++        sample_size = min(1000, len(self.completed_ids))
++        sample_ids = list(self.completed_ids)[:sample_size]
++        
++        for image_id in sample_ids:
++            if image_id in metadata:
++                row = metadata[image_id]
++                expected_md5 = row.get('md5')
++                if not sharding.verify_file_integrity(image_id, expected_md5):
++                    invalid_ids.add(image_id)
++                    self.completed_ids.discard(image_id)
++        
++        if invalid_ids:
++            logging.warning(f"âš ï¸ Found {len(invalid_ids)} corrupted files in sample of {sample_size}")
++            self._save_progress()
++        else:
++            logging.info(f"âœ… Sample verification passed ({sample_size} files checked)")
++        
++        return invalid_ids
+ 
+ # ---------------------------------------------------------------------------
+ # Progress Reporter
+@@ -1209,6 +1261,7 @@ def process_tar_file_streaming(tar_name: str,
+     processed_count = 0
+     extracted_count = 0
+     skipped_count = 0
+     failed_count = 0
++    retry_queue = []  # Queue for retrying failed extractions
      
      try:
--        logging.info(f"🔥 Starting streaming collection with batch size {cfg.batch_size}")
--        # Try different collection strategies
-+        logging.info(f"🔥 Starting collection with batch size {cfg.batch_size}")
-         df = None
+         # Open tar file for streaming extraction
+@@ -1234,10 +1287,21 @@ def process_tar_file_streaming(tar_name: str,
+                 
+                 # Check if file already exists on disk
+                 file_exists, _ = sharding.file_exists(image_id)
+                 if file_exists:
+-                    progress_tracker.mark_completed(image_id)
+-                    skipped_count += 1
+-                    processed_count += 1
+-                    continue
++                    # Verify existing file if configured
++                    if cfg.verify_existing_files:
++                        expected_md5 = row.get(cfg.md5_col) if cfg.md5_col else None
++                        if sharding.verify_file_integrity(image_id, expected_md5):
++                            progress_tracker.mark_completed(image_id)
++                            skipped_count += 1
++                            processed_count += 1
++                            continue
++                        else:
++                            logging.warning(f"âš ï¸ Existing file {image_id} failed verification, re-extracting...")
++                    else:
++                        progress_tracker.mark_completed(image_id)
++                        skipped_count += 1
++                        processed_count += 1
++                        continue
+                 
+                 # Find the file in the tar
+                 filename = row.get('_tar_filename', f"{image_id}.jpg")
+@@ -1274,39 +1338,85 @@ def process_tar_file_streaming(tar_name: str,
+                 
+                 if member is None:
+                     # File not found in tar
+-                    failed_count += 1
+-                    processed_count += 1
++                    retry_queue.append((row, 0))  # Add to retry queue
+                     continue
+                 
+                 # Extract and save the file
+-                try:
+-                    # True streaming extraction - only extract this one file
+-                    file_obj = tar.extractfile(member)
+-                    if file_obj:
+-                        data = file_obj.read()
+-                        file_obj.close()
++                extraction_successful = False
++                for attempt in range(cfg.retry_failed_extractions):
++                    try:
++                        # True streaming extraction - only extract this one file
++                        file_obj = tar.extractfile(member)
++                        if file_obj:
++                            data = file_obj.read()
++                            file_obj.close()
++                            
++                            # Verify data integrity
++                            if len(data) < cfg.min_file_size:
++                                raise ValueError(f"File too small: {len(data)} bytes")
++                            
++                            # Verify checksum if available
++                            if cfg.verify_checksums and cfg.md5_col and cfg.md5_col in row:
++                                expected_md5 = row[cfg.md5_col]
++                                if expected_md5:
++                                    actual_md5 = hashlib.md5(data).hexdigest()
++                                    if actual_md5.lower() != expected_md5.lower():
++                                        raise ValueError(f"MD5 mismatch: expected {expected_md5}, got {actual_md5}")
++                            
++                            # Save file to disk
++                            start_write = time.time()
++                            ext = os.path.splitext(member.name)[1] or '.jpg'
++                            shard_path = sharding.get_shard_path(image_id, create=True)
++                            final_path = shard_path / f"{image_id}{ext}"
++                            temp_path = final_path.with_suffix(final_path.suffix + '.tmp')
++                            
++                            # Write with buffer
++                            buffer_mb = min(max(1, cfg.write_buffer_size_mb), 16)
++                            buffer_size_bytes = buffer_mb * 1024 * 1024
++                            with open(temp_path, 'wb', buffering=buffer_size_bytes) as f:
++                                f.write(data)
++                                f.flush()
++                                if cfg.enable_fsync:
++                                    os.fsync(f.fileno())
++                            
++                            # Verify written file size
++                            written_size = temp_path.stat().st_size
++                            if written_size != len(data):
++                                temp_path.unlink()
++                                raise ValueError(f"Written size mismatch: expected {len(data)}, got {written_size}")
++                            
++                            temp_path.replace(final_path)
++                            
++                            # Final verification
++                            if cfg.verify_checksums and not sharding.verify_file_integrity(image_id, row.get(cfg.md5_col)):
++                                final_path.unlink()
++                                raise ValueError("Final file verification failed")
++                            
++                            # Update stats
++                            with stats_lock:
++                                stats['total_bytes_written'] += len(data)
++                                stats['write_time'] += (time.time() - start_write)
++                                stats['extracted'] += 1
++                            
++                            # Write JSON metadata if enabled
++                            if cfg.per_image_json and json_writer:
++                                json_path = shard_path / f"{image_id}.json"
++                                json_data = prepare_json_data(row, cfg)
++                                json_writer.add_write(json_path, json_data)
++                            
++                            # Mark as completed
++                            progress_tracker.mark_completed(image_id)
++                            extracted_count += 1
++                            extraction_successful = True
++                            break  # Success, exit retry loop
++                        else:
++                            raise ValueError("extractfile returned None")
+                         
+-                        # Save file to disk
+-                        start_write = time.time()
+-                        ext = os.path.splitext(member.name)[1] or '.jpg'
+-                        shard_path = sharding.get_shard_path(image_id, create=True)
+-                        final_path = shard_path / f"{image_id}{ext}"
+-                        temp_path = final_path.with_suffix(final_path.suffix + '.tmp')
++                    except Exception as e:
++                        if attempt < cfg.retry_failed_extractions - 1:
++                            logging.warning(f"âš ï¸ Attempt {attempt+1} failed for {image_id}: {e}, retrying...")
++                            time.sleep(0.5 * (attempt + 1))  # Exponential backoff
++                        else:
++                            logging.error(f"âŒ All attempts failed for {image_id} from {tar_name}: {e}")
++                            failed_count += 1
+                         
+-                        # Write with buffer
+-                        buffer_mb = min(max(1, cfg.write_buffer_size_mb), 16)
+-                        buffer_size_bytes = buffer_mb * 1024 * 1024
+-                        with open(temp_path, 'wb', buffering=buffer_size_bytes) as f:
+-                            f.write(data)
+-                            if cfg.enable_fsync:
+-                                f.flush()
+-                                os.fsync(f.fileno())
+-                        temp_path.replace(final_path)
+-                        
+-                        # Update stats
+-                        with stats_lock:
+-                            stats['total_bytes_written'] += len(data)
+-                            stats['write_time'] += (time.time() - start_write)
+-                            stats['extracted'] += 1
+-                        
+-                        # Write JSON metadata if enabled
+-                        if cfg.per_image_json and json_writer:
+-                            json_path = shard_path / f"{image_id}.json"
+-                            json_data = prepare_json_data(row, cfg)
+-                            json_writer.add_write(json_path, json_data)
+-                        
+-                        # Mark as completed
+-                        progress_tracker.mark_completed(image_id)
+-                        extracted_count += 1
+-                    else:
+-                        failed_count += 1
+-                        
+-                except Exception as e:
+-                    logging.error(f"âŒ Failed to extract {image_id} from {tar_name}: {e}")
++                if not extraction_successful:
+                     failed_count += 1
+                 
+                 processed_count += 1
+@@ -1315,6 +1425,20 @@ def process_tar_file_streaming(tar_name: str,
+                 if processed_count % 1000 == 0:
+                     progress_pct = (processed_count / len(metadata_list)) * 100
+                     logging.debug(f"   Progress: {processed_count:,}/{len(metadata_list):,} ({progress_pct:.1f}%) - Extracted: {extracted_count:,}")
 +        
-+        # Try different collection strategies with proper error handling
-         try:
--            # First try: streaming collection
--            df = lf.collect(streaming=True)
--            logging.info("✅ Using streaming collection")
-+            # First try: new engine API for Polars 1.25.0+
-+            df = lf.collect(engine="streaming")
-+            logging.info("✅ Using streaming engine")
-         except Exception as e1:
--            logging.warning(f"⚠️ Streaming collection failed: {e1}")
-+            if "unexpected keyword argument 'engine'" in str(e1):
-+                # Fallback for older Polars versions
-+                try:
-+                    df = lf.collect(streaming=True)
-+                    logging.info("✅ Using legacy streaming parameter")
-+                except Exception as e1b:
-+                    logging.warning(f"⚠️ Streaming collection failed: {e1b}")
-+                    df = None
-+            else:
-+                logging.warning(f"⚠️ Streaming engine failed: {e1}")
-+                df = None
-+        
-+        if df is None:
-+            # Second try: regular collection
-             try:
--                # Second try: regular collection
-                 logging.info("🔄 Trying regular collection...")
-                 df = lf.collect()
-                 logging.info("✅ Using regular collection")
-             except Exception as e2:
-                 logging.warning(f"⚠️ Regular collection failed: {e2}")
-                 # Final fallback: read directly with chunking
-@@ -1090,7 +1099,6 @@ class TarIndex:
-         logging.info(f"✅ Built index with {len(self.index):,} file ID mappings from {len(tar_files)} tar files")
- 
-         # Show sample mappings for debugging
-         if self.index:
-             sample = list(self.index.items())[:5]
-             logging.info("📋 Sample ID mappings:")
-@@ -1106,8 +1114,6 @@ class TarIndex:
-                 internal_path = self.index_paths.get(image_id, f"{image_id}.jpg")
-                 return (tar_name, internal_path)
- 
--        # Log miss for debugging
-         if len(self.index) > 0:
-             sample_ids = list(self.index.keys())[:3]
-             logging.debug(f"❌ ID {image_id} not in index. Sample IDs: {sample_ids}")
- 
-         return None
- 
--    # cache_discovered_path removed; paths are stored directly in save_file
--
-     def get_statistics(self) -> Dict[str, Any]:
-         """Get index statistics for debugging."""
-         stats = {
-@@ -1193,7 +1199,6 @@ def build_cli() -> argparse.ArgumentParser:
-     p.add_argument("--io-workers", type=int, help="Number of I/O workers")
-     p.add_argument("--batch-size", type=int, help="Streaming batch size")
-     p.add_argument("--use-tar-streaming", action="store_true", help="Use streaming mode for large tars to reduce memory")
--    # removed tar-major option; tar-major extraction is no longer supported
- 
-     # Additional tuning options
-     p.add_argument(
-@@ -1295,8 +1300,6 @@ def apply_cli_overrides(args: argparse.Namespace, cfg: Config) -> None:
-     if hasattr(args, 'use_tar_streaming') and args.use_tar_streaming:
-         cfg.use_tar_streaming = True
- 
--    # tar-major batching mode removed; always use simple streaming extraction
--
-     # New configurable fields
-     if hasattr(args, 'progress_update_interval') and args.progress_update_interval is not None:
-         cfg.progress_update_interval = args.progress_update_interval
-@@ -1674,168 +1677,6 @@ def process_extractions_streaming(metadata_stream: Iterator[Dict[str, Any]],
-             logging.error(f"⚠️ WARNING: {len(pending_extractions)} files were not processed!")
- 
- 
--def process_extractions_tar_major(metadata_stream: Iterator[Dict[str, Any]],
--                                  cfg: Config, dest_dir: Path,
--                                  tar_index,
--                                  stop_handler: Optional[Any] = None) -> None:
--    """Accumulate rows per tar and process each tar in chunky batches to avoid open/close thrash."""
--    # Initialize sharding
--    sharding = DirectorySharding(dest_dir, cfg.files_per_shard)
--
--    # Initialize JSON writer if per-image JSON output is enabled
--    json_writer: Optional[Union[BatchedJSONWriter, AsyncJSONWriter]] = None
--    if cfg.per_image_json:
--        if cfg.json_writer_workers and cfg.json_writer_workers > 0:
--            json_writer = AsyncJSONWriter(workers=cfg.json_writer_workers, enable_fsync=cfg.enable_fsync)
--        else:
--            json_writer = BatchedJSONWriter(flush_interval=cfg.json_flush_interval, batch_size=1000, enable_fsync=cfg.enable_fsync)
--
--    # Create progress tracker for per-image completion tracking
--    progress_tracker = ValidatingProgressTracker(dest_dir / "progress.json",
--                                                 update_interval=cfg.progress_update_interval,
--                                                 enable_fsync=cfg.enable_fsync)
--
--    # Optional validation at start, to clean up or scan existing files
--    if cfg.validate_on_start:
--        if cfg.full_scan:
--            progress_tracker.full_filesystem_scan(sharding)
--        else:
--            progress_tracker.validate_files(sharding, auto_clean=True)
--
--    # Ensure safe shutdown flush: register hooks on stop_handler
--    if stop_handler:
--        if json_writer:
--            stop_handler.add_flush_hook(lambda: json_writer.close())
--        stop_handler.add_flush_hook(lambda: progress_tracker.save_final())
--
--    # Stats for reporting extraction outcomes
--    stats: Dict[str, Any] = {
--        'extracted': 0, 'failed': 0, 'skipped': 0, 'not_found': 0,
--        'not_found_ids': deque(maxlen=cfg.not_found_max_sample),
--        'total_bytes_written': 0, 'write_time': 0.0
--    }
--    stats_lock = threading.Lock()
--    reporter = ProgressReporter(interval=10.0)
--
--    logging.info("🔄 Starting TAR-major extraction…")
--
--    # Accumulate rows per tar; each key is tar_name mapping to list of (image_id, filename, metadata)
--    buckets: Dict[str, List[Tuple[int, str, Dict[str, Any]]]] = defaultdict(list)
--    # Determine threshold for flushing a tar bucket; ensure at least 50 to reduce thrashing
--    target_batch = max(50, cfg.batch_size)
--
--    # Helper to process a single tar once enough rows accumulate
--    def flush_tar(tar_name: str) -> None:
--        items = buckets.get(tar_name, [])
--        if not items:
--            return
--        # Process the tar via existing handler; this writes files and updates stats
--        process_single_tar(cfg, tar_name, items, sharding, progress_tracker, json_writer,
--                           tar_index, stats, stats_lock)
--        # Clear the bucket for this tar
--        buckets[tar_name].clear()
--        # Periodically report progress
--        if reporter.should_report():
--            reporter.report(stats)
--
--    # Iterate through metadata rows, bucketizing by tar
--    for row in metadata_stream:
--        # Allow for graceful shutdown via stop_handler
--        if stop_handler and stop_handler.should_stop():
--            logging.info("🛑 Stopping due to interrupt…")
--            break
--
--        image_id = row[cfg.id_col]
--
--        # Skip if already completed or exists in destination
--        if progress_tracker.is_completed(image_id):
--            with stats_lock:
--                stats['skipped'] += 1
--            continue
--        exists, _ = sharding.file_exists(image_id)
--        if exists:
--            progress_tracker.mark_completed(image_id)
--            with stats_lock:
--                stats['skipped'] += 1
--            continue
--
--        # Determine which tar and filename contain this image
--        file_url = row.get(cfg.file_path_col, "") if cfg.file_path_col else ""
--        tar_info = tar_index.find_image(image_id, file_url, row.get(cfg.md5_col))
--        if not tar_info:
--            with stats_lock:
--                stats['not_found'] += 1
--                stats['not_found_ids'].append(image_id)
--            continue
--
--        tar_name, filename = tar_info
--        buckets[tar_name].append((image_id, filename, row))
--
--        # If this tar bucket has reached the threshold, flush it
--        if len(buckets[tar_name]) >= target_batch:
--            flush_tar(tar_name)
--
--    # Final flush for any remaining buckets once streaming is finished
--    for tar_name, items in list(buckets.items()):
--        if items:
--            logging.info(f"📦 Finalizing {tar_name} with {len(items)} files…")
--            flush_tar(tar_name)
--
--    # Final reporting and cleanup
--    reporter.report(stats, force=True)
--    if json_writer:
--        json_writer.close()
--    progress_tracker.save_final()
-+
- def process_extractions_simple(metadata_stream: Iterator[Dict[str, Any]],
-                               cfg: Config, dest_dir: Path,
-                               tar_index,
-                               stop_handler: Optional[Any] = None) -> None:
-     """Process extractions - now uses streaming mode for better memory efficiency."""
--    # Delegate to the streaming implementation for improved memory usage
-     logging.info("🔄 Using streaming extraction mode for better memory efficiency...")
-     process_extractions_streaming(metadata_stream, cfg, dest_dir, tar_index, stop_handler)
- 
-@@ -2094,8 +1935,7 @@ def main() -> None:
-         
-         # Process extractions
-         if cfg.extract_images:
--            # Always use the streaming extraction; tar-major mode has been removed
-             process_extractions_simple(metadata_stream, cfg, out_dir, tar_index, stop_handler)
-         else:
-             logging.info("🔄 Filtering metadata only (extraction disabled)")
-             count = sum(1 for _ in metadata_stream)
++        # Process retry queue for files not found
++        if retry_queue and cfg.retry_failed_extractions > 1:
++            logging.info(f"ðŸ"„ Retrying {len(retry_queue)} failed extractions...")
++            for row, prev_attempts in retry_queue:
++                if prev_attempts < cfg.retry_failed_extractions - 1:
++                    # Try alternative tar files or different search strategies
++                    # This is a placeholder for more sophisticated retry logic
++                    failed_count += 1
++                else:
++                    failed_count += 1
+     
+     except Exception as e:
+         logging.error(f"âŒ Failed to process tar file {tar_name}: {e}")

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 RAID-Optimized Danbooru dataset filtering and extraction script.
-Optimizations for RAID 5 source and RAID 0 destination with high RAM.
+Fixed version addressing tar file ordering and memory efficiency issues.
 """
 
 from __future__ import annotations
@@ -106,11 +106,11 @@ class Config:
     rebuild_tar_index: bool = False
 
     # ---- Performance settings ---------------------------------------------
-    workers: int = 24  # CPU-bound extraction workers
-    io_workers: int = 12  # I/O-bound JSON and file writers
+    workers: int = 12  # Reduced for better memory management
+    io_workers: int = 8  # I/O-bound JSON and file writers
     files_per_shard: int = 10000
     batch_size: int = 1000  # Number of metadata rows to read at once
-    write_buffer_size_mb: int = 12
+    write_buffer_size_mb: int = 8  # Reduced buffer size
     progress_update_interval: int = 5000
 
     json_writer_workers: int = 4
@@ -119,7 +119,7 @@ class Config:
 
     json_flush_interval: float = 5.0
     not_found_max_sample: int = 20000
-    use_tar_streaming: bool = False
+    use_tar_streaming: bool = True  # Enable true streaming
 
 # ---------------------------------------------------------------------------
 # Directory Sharding
@@ -731,11 +731,13 @@ def detect_metadata_structure(path: Path, cfg: Config) -> None:
     except Exception as e:
         logging.debug(f"Failed to inspect metadata: {e}")
 
-def stream_filtered_metadata(path: Path, cfg: Config, stop_handler: Optional[SoftStopHandler] = None) -> Iterator[Dict[str, Any]]:
+def collect_and_group_metadata(path: Path, cfg: Config, tar_index, stop_handler: Optional[SoftStopHandler] = None) -> Dict[str, List[Dict[str, Any]]]:
     """
-    Streams filtered metadata using collect() for constant memory.
-    Yields individual rows as dictionaries.
+    Collect all filtered metadata and group by tar file.
+    Returns dict mapping tar_name -> list of metadata rows.
     """
+    logging.info("📋 Collecting and grouping metadata by tar file...")
+    
     # Build lazy frame
     lf = pl.scan_parquet(str(path))
     
@@ -858,9 +860,9 @@ def stream_filtered_metadata(path: Path, cfg: Config, stop_handler: Optional[Sof
     lf = lf.filter(filter_expr)
     
     try:
-        logging.info(f"📥 Starting collection with batch size {cfg.batch_size}")
+        logging.info(f"🔥 Starting metadata collection...")
         
-        # Try to collect the data
+        # Collect the filtered data
         df = None
         try:
             df = lf.collect()
@@ -883,42 +885,340 @@ def stream_filtered_metadata(path: Path, cfg: Config, stop_handler: Optional[Sof
         
         if df is None or len(df) == 0:
             logging.warning("⚠️ No images match the filter criteria!")
-            return
+            return {}
         
         total_rows = len(df)
         logging.info(f"📊 Filtered metadata contains {total_rows:,} matching images")
         
-        # Stream rows
-        batch_count = 0
-        total_yielded = 0
-        slice_size = min(cfg.batch_size, 10000)
+        # Group by tar file
+        grouped_metadata = defaultdict(list)
+        not_found_count = 0
         
-        for batch_df in df.iter_slices(slice_size):
-            batch_count += 1
-            if batch_count % 5 == 0 or total_yielded == 0:
-                progress_pct = (total_yielded / total_rows * 100) if total_rows > 0 else 0
-                logging.info(f"📊 Processing batch {batch_count} ({total_yielded:,}/{total_rows:,} items - {progress_pct:.1f}%)...")
-            
+        logging.info("🗂️ Grouping metadata by tar file...")
+        for row in df.iter_rows(named=True):
             if stop_handler and stop_handler.should_stop():
-                logging.info("🛑 Stopping stream due to user interrupt...")
+                logging.info("🛑 Stopping metadata collection due to user interrupt...")
                 break
+                
+            image_id = row[cfg.id_col]
+            file_url = row.get(cfg.file_path_col, "") if cfg.file_path_col else ""
+            tar_info = tar_index.find_image(image_id, file_url, row.get(cfg.md5_col))
             
-            for row in batch_df.iter_rows(named=True):
-                total_yielded += 1
-                yield row
+            if not tar_info:
+                not_found_count += 1
+                continue
+                
+            tar_name, filename = tar_info
+            row['_tar_filename'] = filename  # Store the internal tar filename
+            grouped_metadata[tar_name].append(row)
         
-        if total_yielded > 0:
-            logging.info(f"✅ Streamed {total_yielded:,} filtered items")
-            
+        logging.info(f"📊 Grouped {total_rows - not_found_count:,} images into {len(grouped_metadata)} tar files")
+        if not_found_count > 0:
+            logging.warning(f"⚠️ {not_found_count:,} images not found in tar index")
+        
+        # Sort tar files for efficient processing (0000.tar, 0001.tar, etc.)
+        sorted_grouped = {}
+        for tar_name in sorted(grouped_metadata.keys()):
+            file_count = len(grouped_metadata[tar_name])
+            logging.info(f"   {tar_name}: {file_count:,} files")
+            sorted_grouped[tar_name] = grouped_metadata[tar_name]
+        
+        return sorted_grouped
+        
     except Exception as e:
-        logging.error(f"❌ Error during streaming: {e}")
+        logging.error(f"❌ Error during metadata collection: {e}")
         raise
+
+def process_tar_file_streaming(tar_name: str, 
+                             metadata_list: List[Dict[str, Any]],
+                             cfg: Config, 
+                             source_dir: Path,
+                             sharding: DirectorySharding,
+                             progress_tracker: ValidatingProgressTracker,
+                             json_writer: Optional[Union[BatchedJSONWriter, AsyncJSONWriter]],
+                             stats: Dict[str, Any],
+                             stats_lock: threading.Lock,
+                             stop_handler: Optional[SoftStopHandler] = None) -> None:
+    """
+    Process a single tar file using true streaming extraction.
+    This opens the tar once and extracts all needed files efficiently.
+    """
+    tar_path = source_dir / tar_name
+    if not tar_path.exists():
+        logging.error(f"❌ Tar file not found: {tar_path}")
+        with stats_lock:
+            stats['failed'] += len(metadata_list)
+        return
+    
+    logging.info(f"📦 Processing {tar_name} ({len(metadata_list):,} files)...")
+    
+    # Build lookup map: filename -> metadata row
+    filename_to_metadata = {}
+    id_to_metadata = {}
+    
+    for row in metadata_list:
+        image_id = row[cfg.id_col]
+        filename = row.get('_tar_filename', f"{image_id}.jpg")
+        filename_to_metadata[filename] = row
+        id_to_metadata[image_id] = row
+    
+    processed_count = 0
+    extracted_count = 0
+    skipped_count = 0
+    failed_count = 0
+    
+    try:
+        # Open tar file for streaming extraction
+        with tarfile.open(tar_path, 'r') as tar:
+            # Get all members once (this is lightweight - just metadata)
+            members = {member.name: member for member in tar.getmembers() if member.isfile()}
+            
+            logging.debug(f"   Tar contains {len(members):,} total files")
+            
+            # Process each metadata row
+            for row in metadata_list:
+                if stop_handler and stop_handler.should_stop():
+                    logging.info("🛑 Stopping tar processing due to user interrupt...")
+                    break
+                
+                image_id = row[cfg.id_col]
+                
+                # Skip if already completed
+                if progress_tracker.is_completed(image_id):
+                    skipped_count += 1
+                    processed_count += 1
+                    continue
+                
+                # Check if file already exists on disk
+                file_exists, _ = sharding.file_exists(image_id)
+                if file_exists:
+                    progress_tracker.mark_completed(image_id)
+                    skipped_count += 1
+                    processed_count += 1
+                    continue
+                
+                # Find the file in the tar
+                filename = row.get('_tar_filename', f"{image_id}.jpg")
+                member = None
+                
+                # Strategy 1: Direct filename match
+                if filename in members:
+                    member = members[filename]
+                
+                # Strategy 2: Try different extensions
+                if member is None:
+                    basename = os.path.splitext(filename)[0]
+                    for ext in ['.jpg', '.jpeg', '.png', '.webp', '.gif']:
+                        test_name = f"{basename}{ext}"
+                        if test_name in members:
+                            member = members[test_name]
+                            break
+                
+                # Strategy 3: Try just the image ID with extensions
+                if member is None:
+                    for ext in ['.jpg', '.jpeg', '.png', '.webp', '.gif']:
+                        test_name = f"{image_id}{ext}"
+                        if test_name in members:
+                            member = members[test_name]
+                            break
+                
+                # Strategy 4: Search by image ID in filename
+                if member is None:
+                    id_str = str(image_id)
+                    for member_name, member_obj in members.items():
+                        if id_str in member_name:
+                            member = member_obj
+                            break
+                
+                if member is None:
+                    # File not found in tar
+                    failed_count += 1
+                    processed_count += 1
+                    continue
+                
+                # Extract and save the file
+                try:
+                    # True streaming extraction - only extract this one file
+                    file_obj = tar.extractfile(member)
+                    if file_obj:
+                        data = file_obj.read()
+                        file_obj.close()
+                        
+                        # Save file to disk
+                        start_write = time.time()
+                        ext = os.path.splitext(member.name)[1] or '.jpg'
+                        shard_path = sharding.get_shard_path(image_id, create=True)
+                        final_path = shard_path / f"{image_id}{ext}"
+                        temp_path = final_path.with_suffix(final_path.suffix + '.tmp')
+                        
+                        # Write with buffer
+                        buffer_mb = min(max(1, cfg.write_buffer_size_mb), 16)
+                        buffer_size_bytes = buffer_mb * 1024 * 1024
+                        with open(temp_path, 'wb', buffering=buffer_size_bytes) as f:
+                            f.write(data)
+                            if cfg.enable_fsync:
+                                f.flush()
+                                os.fsync(f.fileno())
+                        temp_path.replace(final_path)
+                        
+                        # Update stats
+                        with stats_lock:
+                            stats['total_bytes_written'] += len(data)
+                            stats['write_time'] += (time.time() - start_write)
+                            stats['extracted'] += 1
+                        
+                        # Write JSON metadata if enabled
+                        if cfg.per_image_json and json_writer:
+                            json_path = shard_path / f"{image_id}.json"
+                            json_data = prepare_json_data(row, cfg)
+                            json_writer.add_write(json_path, json_data)
+                        
+                        # Mark as completed
+                        progress_tracker.mark_completed(image_id)
+                        extracted_count += 1
+                    else:
+                        failed_count += 1
+                        
+                except Exception as e:
+                    logging.error(f"❌ Failed to extract {image_id} from {tar_name}: {e}")
+                    failed_count += 1
+                
+                processed_count += 1
+                
+                # Progress update
+                if processed_count % 1000 == 0:
+                    progress_pct = (processed_count / len(metadata_list)) * 100
+                    logging.debug(f"   Progress: {processed_count:,}/{len(metadata_list):,} ({progress_pct:.1f}%) - Extracted: {extracted_count:,}")
+    
+    except Exception as e:
+        logging.error(f"❌ Failed to process tar file {tar_name}: {e}")
+        with stats_lock:
+            stats['failed'] += len(metadata_list) - processed_count
+        return
+    
+    # Update final stats
+    with stats_lock:
+        stats['skipped'] += skipped_count
+        stats['not_found'] += failed_count
+    
+    # Log completion
+    mem_usage = psutil.Process().memory_info().rss / 1024**3
+    logging.info(f"✅ Completed {tar_name}: {extracted_count:,} extracted, {skipped_count:,} skipped, {failed_count:,} failed | Memory: {mem_usage:.1f}GB")
+
+def process_extractions_by_tar_file(grouped_metadata: Dict[str, List[Dict[str, Any]]],
+                                   cfg: Config, dest_dir: Path,
+                                   source_dir: Path,
+                                   stop_handler: Optional[SoftStopHandler] = None) -> None:
+    """
+    Process extractions grouped by tar file for maximum efficiency.
+    Each tar file is opened once and all needed files are extracted.
+    """
+    
+    sharding = DirectorySharding(dest_dir, cfg.files_per_shard)
+    
+    json_writer: Optional[Union[BatchedJSONWriter, AsyncJSONWriter]] = None
+    if cfg.per_image_json:
+        if cfg.json_writer_workers and cfg.json_writer_workers > 0:
+            json_writer = AsyncJSONWriter(workers=cfg.json_writer_workers, enable_fsync=cfg.enable_fsync)
+        else:
+            json_writer = BatchedJSONWriter(flush_interval=cfg.json_flush_interval, batch_size=1000, enable_fsync=cfg.enable_fsync)
+    
+    progress_tracker = ValidatingProgressTracker(dest_dir / "progress.json", update_interval=cfg.progress_update_interval, enable_fsync=cfg.enable_fsync)
+    
+    if cfg.validate_on_start:
+        if cfg.full_scan:
+            progress_tracker.full_filesystem_scan(sharding)
+        else:
+            progress_tracker.validate_files(sharding, auto_clean=True)
+    
+    stats: Dict[str, Any] = {
+        'extracted': 0,
+        'failed': 0,
+        'skipped': 0,
+        'not_found': 0,
+        'total_bytes_written': 0,
+        'write_time': 0.0
+    }
+    stats_lock = threading.Lock()
+    
+    progress_reporter = ProgressReporter(interval=10.0)
+    
+    if stop_handler:
+        if json_writer:
+            stop_handler.add_flush_hook(lambda: json_writer.close())
+        stop_handler.add_flush_hook(lambda: progress_tracker.save_final())
+    
+    initial_stats = progress_tracker.get_statistics()
+    logging.info(f"📊 Starting with {initial_stats['completed']:,} completed, {initial_stats['missing']:,} missing")
+    logging.info(f"🚀 Using tar-grouped extraction with {cfg.workers} workers")
+    logging.info(f"💾 RAID optimized: {cfg.write_buffer_size_mb}MB write buffers")
+    
+    try:
+        total_tar_files = len(grouped_metadata)
+        total_images = sum(len(files) for files in grouped_metadata.values())
+        logging.info(f"📦 Processing {total_tar_files} tar files containing {total_images:,} images")
+        
+        # Process tar files in order (0000.tar, 0001.tar, etc.)
+        with ThreadPoolExecutor(max_workers=min(cfg.workers, 4)) as executor:  # Limit concurrent tar files
+            futures = []
+            
+            for i, (tar_name, metadata_list) in enumerate(grouped_metadata.items()):
+                if stop_handler and stop_handler.should_stop():
+                    logging.info("🛑 Stopping extraction due to user interrupt...")
+                    break
+                
+                logging.info(f"🔄 Queuing {tar_name} ({i+1}/{total_tar_files}) - {len(metadata_list):,} files")
+                
+                future = executor.submit(
+                    process_tar_file_streaming,
+                    tar_name, metadata_list, cfg, source_dir,
+                    sharding, progress_tracker, json_writer,
+                    stats, stats_lock, stop_handler
+                )
+                futures.append(future)
+                
+                # Limit the number of concurrent tar files to prevent memory issues
+                if len(futures) >= min(cfg.workers // 2, 2):
+                    # Wait for at least one to complete
+                    for future in as_completed(futures[:1]):
+                        try:
+                            future.result()
+                        except Exception as e:
+                            logging.error(f"❌ Tar processing failed: {e}")
+                    futures = futures[1:]  # Remove completed future
+                
+                # Report progress
+                if progress_reporter.should_report():
+                    progress_reporter.report(stats)
+            
+            # Wait for remaining futures
+            for future in as_completed(futures):
+                try:
+                    future.result()
+                except Exception as e:
+                    logging.error(f"❌ Tar processing failed: {e}")
+        
+        # Final progress report
+        progress_reporter.report(stats, force=True)
+        
+        logging.info(
+            f"✅ Extraction complete: {stats['extracted']:,} extracted, "
+            f"{stats['failed']:,} failed, {stats['skipped']:,} skipped, "
+            f"{stats['not_found']:,} not found"
+        )
+        
+    finally:
+        if json_writer:
+            json_writer.close()
+        progress_tracker.save_final()
 
 # ---------------------------------------------------------------------------
 # Tar Index
 # ---------------------------------------------------------------------------
 class TarIndex:
     """Index for finding images in tar files."""
+    
+    COMMON_EXTENSIONS = ['.jpg', '.jpeg', '.png', '.webp', '.gif']
     
     def __init__(self, source_dir: Path, rebuild: bool = False):
         self.source_dir = source_dir
@@ -931,8 +1231,9 @@ class TarIndex:
         if cache_file.exists() and not rebuild:
             self._load_existing_cache(cache_file)
         else:
-            logging.info("📚 No existing cache found. Building new index...")
-            self._build_from_json_files()
+            logging.info("📚 Building new tar index...")
+            self._build_comprehensive_index()
+            self._save_cache(cache_file)
     
     def _load_existing_cache(self, cache_file: Path):
         """Load the existing tar_index_cache.json."""
@@ -998,6 +1299,166 @@ class TarIndex:
         elif isinstance(data, list):
             paths.extend([str(x) for x in data if x])
         return paths
+
+    def _build_comprehensive_index(self):
+        """Build index by scanning tar files directly and their manifests."""
+        logging.info("📚 Building comprehensive tar index...")
+        tar_files = sorted(self.source_dir.glob("*.tar"))
+        
+        if not tar_files:
+            logging.error(f"⚠️ No tar files found in {self.source_dir}")
+            return
+        
+        total_files_indexed = 0
+        
+        for tar_path in tar_files:
+            tar_name = tar_path.name
+            logging.info(f"📦 Indexing {tar_name}...")
+            
+            # First try JSON manifest
+            json_indexed = self._index_from_json_manifest(tar_path, tar_name)
+            
+            # If no JSON or insufficient entries, scan tar directly
+            if json_indexed < 100:  # Threshold for considering manifest incomplete
+                logging.info(f"   JSON manifest incomplete ({json_indexed} entries), scanning tar directly...")
+                tar_indexed = self._scan_tar_contents(tar_path, tar_name)
+                total_files_indexed += tar_indexed
+            else:
+                total_files_indexed += json_indexed
+        
+        logging.info(f"✅ Indexed {len(self.index):,} unique file IDs across {len(tar_files)} tar files")
+        logging.info(f"   Total file mappings: {total_files_indexed:,}")
+
+    def _scan_tar_contents(self, tar_path: Path, tar_name: str) -> int:
+        """Scan tar file contents directly to build index."""
+        indexed_count = 0
+        try:
+            with tarfile.open(tar_path, 'r') as tar:
+                members = tar.getmembers()
+                logging.info(f"   Scanning {len(members)} members in {tar_name}...")
+                
+                for member in members:
+                    if member.isfile():
+                        # Extract ID from filename
+                        basename = os.path.basename(member.name)
+                        name_without_ext = os.path.splitext(basename)[0]
+                        
+                        # Try to parse as integer ID
+                        try:
+                            file_id = int(name_without_ext)
+                            self.index[file_id] = tar_name
+                            self.index_paths[file_id] = member.name
+                            indexed_count += 1
+                        except ValueError:
+                            # Not a numeric ID, check if it contains an ID
+                            match = re.search(r'(\d{4,})', name_without_ext)
+                            if match:
+                                file_id = int(match.group(1))
+                                self.index[file_id] = tar_name
+                                self.index_paths[file_id] = member.name
+                                indexed_count += 1
+                
+                logging.info(f"   ✅ Indexed {indexed_count} files from {tar_name}")
+                
+        except Exception as e:
+            logging.error(f"   ❌ Failed to scan {tar_name}: {e}")
+        
+        return indexed_count
+
+    def _index_from_json_manifest(self, tar_path: Path, tar_name: str) -> int:
+        """Try to index from JSON manifest file."""
+        indexed_count = 0
+        
+        # Try different possible manifest filenames
+        possible_manifests = [
+            tar_path.with_suffix('.json'),
+            tar_path.parent / f"{tar_path.stem}_manifest.json",
+            tar_path.parent / f"{tar_path.stem}_files.json",
+        ]
+        
+        for manifest_path in possible_manifests:
+            if manifest_path.exists():
+                try:
+                    with open(manifest_path, 'r', encoding='utf-8') as f:
+                        data = json.load(f)
+                    
+                    # Parse different manifest formats
+                    if isinstance(data, dict):
+                        if 'files' in data:
+                            # Format: {"files": {"12345.jpg": {...}, ...}}
+                            for filename in data['files']:
+                                file_id = self._extract_id_from_filename(filename)
+                                if file_id:
+                                    self.index[file_id] = tar_name
+                                    self.index_paths[file_id] = filename
+                                    indexed_count += 1
+                        else:
+                            # Format: {"12345.jpg": {...}, ...} or {"12345": "path/to/file.jpg"}
+                            for key, value in data.items():
+                                file_id = self._extract_id_from_filename(key)
+                                if file_id:
+                                    self.index[file_id] = tar_name
+                                    if isinstance(value, str):
+                                        self.index_paths[file_id] = value
+                                    else:
+                                        self.index_paths[file_id] = key
+                                    indexed_count += 1
+                    elif isinstance(data, list):
+                        # Format: ["12345.jpg", "67890.png", ...]
+                        for filename in data:
+                            file_id = self._extract_id_from_filename(filename)
+                            if file_id:
+                                self.index[file_id] = tar_name
+                                self.index_paths[file_id] = filename
+                                indexed_count += 1
+                    
+                    if indexed_count > 0:
+                        logging.info(f"   📄 Indexed {indexed_count} files from {manifest_path.name}")
+                        break
+                        
+                except Exception as e:
+                    logging.debug(f"   Could not parse {manifest_path}: {e}")
+        
+        return indexed_count
+
+    def _extract_id_from_filename(self, filename: str) -> Optional[int]:
+        """Extract numeric ID from a filename."""
+        if not isinstance(filename, str):
+            return None
+        
+        # Remove path components
+        basename = os.path.basename(filename)
+        # Remove extension
+        name_without_ext = os.path.splitext(basename)[0]
+        
+        # Try direct integer conversion
+        try:
+            return int(name_without_ext)
+        except ValueError:
+            # Try to extract first sequence of digits (at least 4 digits for danbooru IDs)
+            match = re.search(r'(\d{4,})', name_without_ext)
+            if match:
+                return int(match.group(1))
+        
+        return None
+
+    def _save_cache(self, cache_file: Path):
+        """Save the index to cache file."""
+        try:
+            cache_data = {
+                'image_to_tar': {str(fid): tar for fid, tar in self.index.items()},
+                'image_paths': {str(fid): path for fid, path in self.index_paths.items()},
+                'total_images': len(self.index),
+                'unique_tars': len(set(self.index.values())),
+                'created_at': time.time()
+            }
+            
+            with open(cache_file, 'w') as f:
+                json.dump(cache_data, f, indent=2)
+            
+            logging.info(f"💾 Saved tar index cache with {len(self.index):,} mappings")
+        except Exception as e:
+            logging.error(f"Failed to save cache: {e}")
     
     def _build_from_json_files(self):
         """Build index from the JSON files next to tar files."""
@@ -1054,12 +1515,40 @@ class TarIndex:
                 logging.info(f"   ID {fid} -> {tar} (path: {path})")
     
     def find_image(self, image_id: int, file_url: str = "", md5: Optional[str] = None) -> Optional[Tuple[str, str]]:
-        """Find image by ID in tar files."""
+        """Find image by ID in tar files with fallback strategies."""
         with self.lock:
+            # Primary: direct ID lookup
             if image_id in self.index:
                 tar_name = self.index[image_id]
                 internal_path = self.index_paths.get(image_id, f"{image_id}.jpg")
                 return (tar_name, internal_path)
+            
+            # Fallback 1: Try to extract from file_url if provided
+            if file_url:
+                # Extract potential tar name from URL
+                # URLs might be like: .../images/1234/5678.jpg
+                url_parts = file_url.split('/')
+                for i, part in enumerate(url_parts):
+                    if part.endswith('.tar'):
+                        tar_name = part
+                        # Reconstruct internal path
+                        if i + 1 < len(url_parts):
+                            internal_path = '/'.join(url_parts[i+1:])
+                            return (tar_name, internal_path)
+                
+                # Try to guess tar file based on ID ranges
+                # Many datasets organize by ID ranges (e.g., 0-999999.tar, 1000000-1999999.tar)
+                tar_files = list(self.source_dir.glob("*.tar"))
+                for tar_path in tar_files:
+                    tar_name = tar_path.name
+                    # Check if tar name contains number ranges
+                    if re.search(rf'{image_id}', tar_name) or re.search(rf'{str(image_id)[:3]}', tar_name):
+                        # Make educated guess about internal path
+                        for ext in self.COMMON_EXTENSIONS:
+                            potential_path = f"{image_id}{ext}"
+                            return (tar_name, potential_path)
+        
+        # No match found
         return None
     
     def get_statistics(self) -> Dict[str, Any]:
@@ -1070,282 +1559,28 @@ class TarIndex:
             'sample_mappings': dict(list(self.index.items())[:10]) if self.index else {}
         }
 
-# ---------------------------------------------------------------------------
-# Extraction functions
-# ---------------------------------------------------------------------------
-def process_pending_extractions(tar_handle: tarfile.TarFile,
-                               members: Dict[str, tarfile.TarInfo],
-                               pending: List[Tuple[int, str, Dict[str, Any]]],
-                               cfg: Config,
-                               tar_name: str,
-                               sharding: DirectorySharding,
-                               progress_tracker: ValidatingProgressTracker,
-                               json_writer: Optional[Union[BatchedJSONWriter, AsyncJSONWriter]],
-                               tar_index,
-                               stats: Dict[str, Any],
-                               stats_lock: threading.Lock) -> None:
-    """Process a batch of pending extractions from the current open tar."""
-    if not pending or not tar_handle:
-        return
-    
-    logging.debug(f"📦 Processing {len(pending)} files from {tar_name}")
-    
-    with ThreadPoolExecutor(max_workers=cfg.io_workers) as executor:
-        futures = []
+    def validate_index(self, sample_size: int = 10) -> bool:
+        """Validate that the index is working by checking sample entries."""
+        if not self.index:
+            logging.error("❌ Index is empty!")
+            return False
         
-        for image_id, filename, row in pending:
-            member = members.get(filename)
-            if member is None:
-                basename = filename.rsplit('/', 1)[-1]
-                for m_name, m in members.items():
-                    if m_name.rsplit('/', 1)[-1] == basename:
-                        member = m
-                        break
-            
-            if member is None:
-                with stats_lock:
-                    stats['not_found'] += 1
-                    stats['not_found_ids'].append(image_id)
-                continue
-            
-            try:
-                file_obj = tar_handle.extractfile(member)
-                if file_obj:
-                    data = file_obj.read()
-                    file_obj.close()
-                    
-                    future = executor.submit(
-                        save_file, cfg, image_id, data, row, member, sharding,
-                        progress_tracker, json_writer, tar_index, tar_name, stats, stats_lock
-                    )
-                    futures.append(future)
-            except Exception as e:
-                logging.error(f"Failed to extract {filename}: {e}")
-                with stats_lock:
-                    stats['failed'] += 1
+        sample_ids = list(self.index.keys())[:sample_size]
+        logging.info(f"🔍 Validating index with {len(sample_ids)} sample entries...")
         
-        for future in as_completed(futures):
-            try:
-                future.result()
-            except Exception as e:
-                logging.error(f"Write task failed: {e}")
-                with stats_lock:
-                    stats['failed'] += 1
-
-def process_extractions_streaming(metadata_stream: Iterator[Dict[str, Any]],
-                                 cfg: Config, dest_dir: Path,
-                                 tar_index,
-                                 stop_handler: Optional[Any] = None) -> None:
-    """Process extractions with streaming."""
-    
-    sharding = DirectorySharding(dest_dir, cfg.files_per_shard)
-    
-    json_writer: Optional[Union[BatchedJSONWriter, AsyncJSONWriter]] = None
-    if cfg.per_image_json:
-        if cfg.json_writer_workers and cfg.json_writer_workers > 0:
-            json_writer = AsyncJSONWriter(workers=cfg.json_writer_workers, enable_fsync=cfg.enable_fsync)
-        else:
-            json_writer = BatchedJSONWriter(flush_interval=cfg.json_flush_interval, batch_size=1000, enable_fsync=cfg.enable_fsync)
-    
-    progress_tracker = ValidatingProgressTracker(dest_dir / "progress.json", update_interval=cfg.progress_update_interval, enable_fsync=cfg.enable_fsync)
-    
-    if cfg.validate_on_start:
-        if cfg.full_scan:
-            progress_tracker.full_filesystem_scan(sharding)
-        else:
-            progress_tracker.validate_files(sharding, auto_clean=True)
-    
-    stats: Dict[str, Any] = {
-        'extracted': 0,
-        'failed': 0,
-        'skipped': 0,
-        'not_found': 0,
-        'not_found_ids': deque(maxlen=cfg.not_found_max_sample),
-        'total_bytes_written': 0,
-        'write_time': 0.0
-    }
-    stats_lock = threading.Lock()
-    
-    progress_reporter = ProgressReporter(interval=10.0)
-    
-    if stop_handler:
-        if json_writer:
-            stop_handler.add_flush_hook(lambda: json_writer.close())
-        stop_handler.add_flush_hook(lambda: progress_tracker.save_final())
-    
-    initial_stats = progress_tracker.get_statistics()
-    logging.info(f"📊 Starting with {initial_stats['completed']:,} completed, {initial_stats['missing']:,} missing")
-    logging.info(f"🚀 Using streaming extraction with {cfg.workers} workers, {cfg.io_workers} I/O workers")
-    logging.info(f"💾 RAID optimized: {cfg.write_buffer_size_mb}MB write buffers")
-    
-    current_tar: Optional[str] = None
-    current_tar_handle: Optional[tarfile.TarFile] = None
-    current_members: Dict[str, tarfile.TarInfo] = {}
-    pending_extractions: List[Tuple[int, str, Dict[str, Any]]] = []
-    total_processed = 0
-    BATCH_SIZE = 100
-    
-    try:
-        logging.info("📄 Starting streaming extraction...")
+        valid_count = 0
+        for image_id in sample_ids:
+            tar_name = self.index[image_id]
+            tar_path = self.source_dir / tar_name
+            if tar_path.exists():
+                valid_count += 1
+                logging.debug(f"   ✅ ID {image_id} -> {tar_name} (exists)")
+            else:
+                logging.warning(f"   ❌ ID {image_id} -> {tar_name} (NOT FOUND)")
         
-        for row in metadata_stream:
-            if stop_handler and stop_handler.should_stop():
-                logging.info("🛑 Stopping extraction due to user interrupt...")
-                break
-            
-            image_id = row[cfg.id_col]
-            
-            if progress_tracker.is_completed(image_id):
-                with stats_lock:
-                    stats['skipped'] += 1
-                continue
-            
-            file_exists, _ = sharding.file_exists(image_id)
-            if file_exists:
-                progress_tracker.mark_completed(image_id)
-                with stats_lock:
-                    stats['skipped'] += 1
-                continue
-            
-            file_url = row.get(cfg.file_path_col, "") if cfg.file_path_col else ""
-            tar_info = tar_index.find_image(image_id, file_url, row.get(cfg.md5_col))
-            if not tar_info:
-                with stats_lock:
-                    stats['not_found'] += 1
-                    stats['not_found_ids'].append(image_id)
-                continue
-            
-            tar_name, filename = tar_info
-            
-            if tar_name != current_tar:
-                if pending_extractions and current_tar_handle:
-                    process_pending_extractions(
-                        current_tar_handle, current_members, pending_extractions,
-                        cfg, current_tar, sharding, progress_tracker, json_writer,
-                        tar_index, stats, stats_lock
-                    )
-                    pending_extractions = []
-                
-                if current_tar_handle:
-                    current_tar_handle.close()
-                    mem_usage = psutil.Process().memory_info().rss / 1024**3
-                    logging.info(f"📁 Closed {current_tar} | Memory: {mem_usage:.1f}GB")
-                
-                current_tar = tar_name
-                current_members = {}
-                current_tar_handle = None
-                
-                tar_path_new = Path(cfg.source_images_dir) / tar_name
-                logging.info(f"📂 Opening {tar_name}...")
-                try:
-                    current_tar_handle = tarfile.open(tar_path_new, 'r')
-                    current_members = {m.name: m for m in current_tar_handle}
-                except Exception as e:
-                    logging.error(f"Failed to open tar {tar_name}: {e}")
-                    with stats_lock:
-                        stats['failed'] += 1
-                    current_tar = None
-                    continue
-            
-            pending_extractions.append((image_id, filename, row))
-            total_processed += 1
-            
-            should_process = len(pending_extractions) >= BATCH_SIZE
-            
-            if should_process and current_tar_handle:
-                process_pending_extractions(
-                    current_tar_handle, current_members, pending_extractions,
-                    cfg, current_tar, sharding, progress_tracker, json_writer,
-                    tar_index, stats, stats_lock
-                )
-                pending_extractions = []
-                
-                if progress_reporter.should_report():
-                    progress_reporter.report(stats)
-            
-            if total_processed % 10000 == 0:
-                logging.info(f"📊 Processed {total_processed:,} metadata entries...")
-        
-        # Process remaining
-        if pending_extractions and current_tar_handle:
-            logging.info(f"📦 Processing final batch of {len(pending_extractions)} files...")
-            process_pending_extractions(
-                current_tar_handle, current_members, pending_extractions,
-                cfg, current_tar, sharding, progress_tracker, json_writer,
-                tar_index, stats, stats_lock
-            )
-        
-        if current_tar_handle:
-            current_tar_handle.close()
-        
-        progress_reporter.report(stats, force=True)
-        
-        # Save not-found sample
-        try:
-            not_found_sample = list(stats.get('not_found_ids', []))
-            if not_found_sample:
-                with open(dest_dir / "not_found_ids.sample.json", "w", encoding="utf-8") as f:
-                    json.dump({
-                        "count": stats.get('not_found', 0),
-                        "sample_size": len(not_found_sample),
-                        "ids": not_found_sample
-                    }, f, indent=2)
-        except Exception as e:
-            logging.warning(f"⚠️ Failed to persist not-found sample: {e}")
-        
-        logging.info(
-            f"✅ Extraction complete: {stats['extracted']:,} extracted, "
-            f"{stats['failed']:,} failed, {stats['skipped']:,} skipped, "
-            f"{stats['not_found']:,} not found"
-        )
-        
-    finally:
-        if current_tar_handle:
-            current_tar_handle.close()
-        if json_writer:
-            json_writer.close()
-        progress_tracker.save_final()
-
-def save_file(cfg: Config, image_id: int, data: bytes, row: Dict[str, Any], member: tarfile.TarInfo,
-              sharding: DirectorySharding, progress_tracker: ValidatingProgressTracker,
-              json_writer: Optional[Union[BatchedJSONWriter, AsyncJSONWriter]], tar_index, tar_name: str,
-              stats: Dict[str, Any], stats_lock: threading.Lock) -> None:
-    """Save a single file to disk."""
-    try:
-        start_write = time.time()
-        ext = os.path.splitext(member.name)[1] or '.jpg'
-        shard_path = sharding.get_shard_path(image_id, create=True)
-        final_path = shard_path / f"{image_id}{ext}"
-        temp_path = final_path.with_suffix(final_path.suffix + '.tmp')
-        
-        buffer_mb = min(max(1, cfg.write_buffer_size_mb), 64)
-        buffer_size_bytes = buffer_mb * 1024 * 1024
-        with open(temp_path, 'wb', buffering=buffer_size_bytes) as f:
-            f.write(data)
-            if cfg.enable_fsync:
-                f.flush()
-                os.fsync(f.fileno())
-        temp_path.replace(final_path)
-        
-        with stats_lock:
-            stats['total_bytes_written'] += len(data)
-            stats['write_time'] += (time.time() - start_write)
-            stats['extracted'] += 1
-        
-        if cfg.per_image_json and json_writer:
-            json_path = shard_path / f"{image_id}.json"
-            json_data = prepare_json_data(row, cfg)
-            json_writer.add_write(json_path, json_data)
-        
-        with tar_index.lock:
-            tar_index.index_paths[image_id] = member.name
-        
-        progress_tracker.mark_completed(image_id)
-        
-    except Exception as e:
-        logging.error(f"Failed to save file {image_id}: {e}")
-        with stats_lock:
-            stats['failed'] += 1
+        success_rate = valid_count / len(sample_ids) if sample_ids else 0
+        logging.info(f"📊 Validation: {valid_count}/{len(sample_ids)} tar files exist ({success_rate*100:.1f}%)")
+        return success_rate > 0.5
 
 # ---------------------------------------------------------------------------
 # CLI Functions
@@ -1546,27 +1781,36 @@ def main() -> None:
     logging.info(f"   Unique tar files: {index_stats.get('unique_tars', 0)}")
     if index_stats.get('sample_mappings'):
         logging.info(f"   Sample mappings: {index_stats['sample_mappings']}")
+
+    # Validate the index
+    if not tar_index.validate_index():
+        logging.error("❌ Tar index validation failed! Check your tar files and manifests.")
+        sys.exit(1)
     
-    logging.info(" NOTE: Using 'id' column as primary identifier")
+    logging.info("ℹ️ NOTE: Using 'id' column as primary identifier")
     logging.info("   This column contains the actual image IDs that match tar files")
     logging.info("   Each metadata row describes the image with that row's ID")
     
     with SoftStopHandler() as stop_handler:
-        logging.info(f"📖 Streaming filtered metadata from {meta_path}")
-        metadata_stream = stream_filtered_metadata(meta_path, cfg, stop_handler)
+        logging.info(f"📖 Collecting and grouping metadata from {meta_path}")
+        grouped_metadata = collect_and_group_metadata(meta_path, cfg, tar_index, stop_handler)
+        
+        if not grouped_metadata:
+            logging.warning("⚠️ No matching metadata found!")
+            return
+        
+        total_images = sum(len(files) for files in grouped_metadata.values())
         
         if cfg.dry_run:
-            count = sum(1 for _ in metadata_stream)
-            logging.info(f"🎯 Dry run: {count:,} images match criteria")
+            logging.info(f"🎯 Dry run: {total_images:,} images match criteria across {len(grouped_metadata)} tar files")
             return
         
         if cfg.extract_images:
-            logging.info("📄 Using streaming extraction mode for better memory efficiency...")
-            process_extractions_streaming(metadata_stream, cfg, out_dir, tar_index, stop_handler)
+            logging.info("🔄 Using tar-grouped extraction for maximum efficiency...")
+            process_extractions_by_tar_file(grouped_metadata, cfg, out_dir, source_dir, stop_handler)
         else:
             logging.info("📄 Filtering metadata only (extraction disabled)")
-            count = sum(1 for _ in metadata_stream)
-            logging.info(f"✅ Found {count:,} images matching criteria")
+            logging.info(f"✅ Found {total_images:,} images matching criteria across {len(grouped_metadata)} tar files")
     
     logging.info("🎉 Script completed successfully!")
 
