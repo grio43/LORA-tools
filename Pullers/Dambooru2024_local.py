@@ -111,7 +111,7 @@ class Config:
     io_workers: int = 8  # I/O-bound JSON and file writers
     files_per_shard: int = 10000
     batch_size: int = 1000  # Number of metadata rows to read at once
-    write_buffer_size_mb: int = 8  # Reduced buffer size
+    write_buffer_size_mb: int = 128  # Reduced buffer size
     progress_update_interval: int = 5000
 
     json_writer_workers: int = 4
@@ -1234,6 +1234,9 @@ def process_tar_file_streaming(tar_name: str,
     Process a single tar file using true streaming extraction.
     This opens the tar once and extracts all needed files efficiently.
     """
+    # Initialize retry queue for files not found on first attempt
+    retry_queue = []
+
     tar_path = source_dir / tar_name
     if not tar_path.exists():
         logging.error(f"❌ Tar file not found: {tar_path}")
@@ -1481,7 +1484,7 @@ def process_extractions_by_tar_file(grouped_metadata: Dict[str, List[Dict[str, A
         logging.info(f"📦 Processing {total_tar_files} tar files containing {total_images:,} images")
         
         # Process tar files in order (0000.tar, 0001.tar, etc.)
-        with ThreadPoolExecutor(max_workers=min(cfg.workers, 4)) as executor:  # Limit concurrent tar files
+        with ThreadPoolExecutor(max_workers=cfg.workers) as executor:  # Limit concurrent tar files
             futures = []
             
             for i, (tar_name, metadata_list) in enumerate(grouped_metadata.items()):
